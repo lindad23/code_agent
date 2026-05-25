@@ -1,0 +1,7 @@
+# Requires Python 3.11 (recommended) and Git installed on the system.
+# Installs this project in editable mode with development and experiment extras.
+-e .[dev,experiment]
+
+# The main development environment may use CPU PyTorch. Experiment runs select
+# and verify the CUDA-enabled PyTorch runtime in their isolated environment.
+torch>=2.4

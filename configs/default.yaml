@@ -1,0 +1,12 @@
+workspace_root: ./workspaces
+results_root: ./results
+fresh_clone: false
+test_command: python -m pytest -q --tb=short
+allow_apply_patch: false
+max_debug_attempts: 1
+max_patch_repair_attempts: 1
+command_timeout_seconds: 120
+api_provider: null
+llm_model: null
+llm_temperature: 0.2
+llm_max_tokens: 4096

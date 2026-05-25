@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "code-agent-minimal-demo"
+version = "0.1.0"
+description = "A minimal Code Agent demo that clones a repo, runs tests, proposes patches, and optionally applies them."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "langgraph>=0.2.0",
+    "pydantic>=2.0",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+experiment = [
+    "accelerate>=1.2,<2",
+    "datasets>=3.2,<5",
+    "huggingface-hub>=0.27,<2",
+    "numpy>=1.26",
+    "transformers>=4.48,<5",
+]
+
+[project.scripts]
+code-agent = "code_agent.main:main"
+code-agent-experiment = "code_agent.experiment_main:main"
+
+[tool.setuptools.packages.find]
+include = ["code_agent*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

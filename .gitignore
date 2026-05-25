@@ -1,0 +1,44 @@
+# Secrets and local environment variables
+.env
+.env.*
+!.env.example
+
+# Python bytecode and test/tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyright/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+coverage.svg
+
+# Python packaging and virtual environments
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+env/
+.tox/
+.nox/
+
+# Runtime outputs
+results/*
+!results/.gitkeep
+logs/*
+!logs/.gitkeep
+workspaces/*
+!workspaces/.gitkeep
+
+# Machine-local runtime detection
+configs/hardware_profile.local.yaml
+
+# Editor and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
