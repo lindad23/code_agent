@@ -1,5 +1,6 @@
 import subprocess
 import sys
+import tomllib
 from io import StringIO
 from pathlib import Path
 
@@ -41,6 +42,15 @@ def test_experiment_dependencies_are_installed_after_selected_torch(monkeypatch,
     _install_experiment_dependencies(tmp_path, cwd=Path.cwd(), timeout=10)
 
     assert "[experiment]" in commands[0][-1]
+
+
+def test_experiment_dependencies_include_huggingface_xet_download_support():
+    configuration = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+
+    assert any(
+        dependency.startswith("hf_xet")
+        for dependency in configuration["project"]["optional-dependencies"]["experiment"]
+    )
 
 
 def test_detect_hardware_uses_cuda_wheel_index_when_nvidia_smi_is_available(monkeypatch):
@@ -125,3 +135,30 @@ def test_streaming_process_writes_logs_before_returning(tmp_path):
     assert stderr_file.read_text(encoding="utf-8").strip() == "eval step 1"
     assert "train step 1" in output.getvalue()
     assert "eval step 1" in output.getvalue()
+
+
+def test_streaming_process_preserves_carriage_return_progress_updates(tmp_path):
+    output = StringIO()
+    stdout_file = tmp_path / "experiment_stdout.txt"
+    stderr_file = tmp_path / "experiment_stderr.txt"
+
+    completed = _run_process_streaming(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stderr.write('\\rstep 1/2'); sys.stderr.flush(); "
+            "sys.stderr.write('\\rstep 2/2\\n'); sys.stderr.flush()",
+        ],
+        cwd=Path.cwd(),
+        timeout=10,
+        stdout_file=stdout_file,
+        stderr_file=stderr_file,
+        relay_stream=output,
+    )
+
+    assert completed.returncode == 0
+    rendered = output.getvalue()
+    assert rendered.startswith("\rstep 1/2\rstep 2/2")
+    assert "\nstep 2/2" not in rendered
+    with stderr_file.open("r", encoding="utf-8", newline="") as progress_log:
+        assert progress_log.read() == rendered

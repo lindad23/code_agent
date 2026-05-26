@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import json
 import os
 import re
@@ -10,10 +11,11 @@ import uuid
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, TextIO
+from typing import BinaryIO, Callable, TextIO
 
 import yaml
 
+from code_agent.experiments.implementer import build_implementation_prompt, request_implementation
 from code_agent.experiments.models import ExperimentRequest, ExperimentRunState, default_run_id
 from code_agent.experiments.planner import prepare_plan_request, request_experiment_plan
 from code_agent.tools.file_tools import ensure_dir, write_text
@@ -181,12 +183,25 @@ def _verify_torch_runtime(environment_prefix: Path, hardware: HardwareProfile, *
     return runtime
 
 
-def _stream_pipe(pipe: TextIO, targets: list[TextIO], output: list[str]) -> None:
+def _stream_pipe(pipe: BinaryIO, targets: list[TextIO], output: list[str]) -> None:
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     try:
-        for text in iter(pipe.readline, ""):
+        while True:
+            chunk = pipe.read1(4096)
+            if not chunk:
+                break
+            text = decoder.decode(chunk)
+            if not text:
+                continue
             output.append(text)
             for target in targets:
                 target.write(text)
+                target.flush()
+        tail = decoder.decode(b"", final=True)
+        if tail:
+            output.append(tail)
+            for target in targets:
+                target.write(tail)
                 target.flush()
     finally:
         pipe.close()
@@ -208,16 +223,15 @@ def _run_process_streaming(
         cwd=cwd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
         env=environment,
     )
     stdout: list[str] = []
     stderr: list[str] = []
     stdout_file.parent.mkdir(parents=True, exist_ok=True)
     stderr_file.parent.mkdir(parents=True, exist_ok=True)
-    with stdout_file.open("w", encoding="utf-8") as stdout_target, stderr_file.open("w", encoding="utf-8") as stderr_target:
+    with stdout_file.open("w", encoding="utf-8", newline="") as stdout_target, stderr_file.open(
+        "w", encoding="utf-8", newline=""
+    ) as stderr_target:
         stdout_targets = [stdout_target, relay_stream] if relay_stream is not None else [stdout_target]
         stderr_targets = [stderr_target, relay_stream] if relay_stream is not None else [stderr_target]
         threads = [
@@ -289,6 +303,35 @@ def run_experiment_agent(
         write_text(run_results / "state.json", state.model_dump_json(indent=2))
         if plan_only:
             return state
+
+        if progress_callback is not None:
+            progress_callback("implement_improvement")
+        implementation_prompt = build_implementation_prompt(plan, request.task)
+        implementation_prompt_file = write_text(run_results / "implementation_prompt.md", implementation_prompt)
+        state.implementation_prompt_file = str(implementation_prompt_file)
+        state.status = "implementing"
+        write_text(run_results / "state.json", state.model_dump_json(indent=2))
+        try:
+            implementation_source, implementation_response = request_implementation(
+                request,
+                plan,
+                prompt=implementation_prompt,
+            )
+        except Exception as exc:
+            implementation_error_file = write_text(run_results / "implementation_api_error.txt", str(exc))
+            state.implementation_error_file = str(implementation_error_file)
+            raise
+        implementation_response_file = write_text(
+            run_results / "implementation_response.txt",
+            implementation_response,
+        )
+        implementation_file = write_text(run_results / "improvement.py", implementation_source)
+        implementation_workspace_file = write_text(workspace / "generated" / "improvement.py", implementation_source)
+        state.implementation_response_file = str(implementation_response_file)
+        state.implementation_file = str(implementation_file)
+        state.implementation_workspace_file = str(implementation_workspace_file)
+        state.status = "implemented"
+        write_text(run_results / "state.json", state.model_dump_json(indent=2))
 
         if progress_callback is not None:
             progress_callback("prepare_environment")
@@ -385,6 +428,8 @@ def run_experiment_agent(
                 str(workspace),
                 "--results-dir",
                 str(run_results),
+                "--implementation-file",
+                str(implementation_workspace_file),
             ],
             cwd=PROJECT_ROOT,
             timeout=request.timeout_seconds,
@@ -394,6 +439,7 @@ def run_experiment_agent(
         state.stdout_file = str(stdout_file)
         state.stderr_file = str(stderr_file)
         state.metrics_file = str(run_results / "metrics.json")
+        state.report_file = str(run_results / "comparison.md")
         if execute.returncode != 0:
             raise RuntimeError(f"Experiment execution failed. See {stderr_file}")
         state.status = "completed"

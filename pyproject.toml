@@ -22,6 +22,7 @@ experiment = [
     "accelerate>=1.2,<2",
     "datasets>=3.2,<5",
     "huggingface-hub>=0.27,<2",
+    "hf_xet>=1.1,<2",
     "numpy>=1.26",
     "transformers>=4.48,<5",
 ]

@@ -22,6 +22,7 @@ class CliProgress:
         self.current_step = 0
         self._interactive = bool(getattr(self.stream, "isatty", lambda: False)())
         self._closed = False
+        self._rendered_length = 0
 
     def add_steps(self, count: int) -> None:
         if count > 0:
@@ -58,5 +59,8 @@ class CliProgress:
         bar = "#" * filled + "-" * (self.width - filled)
         prefix = "\r" if self._interactive else ""
         suffix = "" if self._interactive else "\n"
-        self.stream.write(f"{prefix}[{bar}] {label}{suffix}")
+        rendered = f"[{bar}] {label}"
+        padding = " " * max(0, self._rendered_length - len(rendered)) if self._interactive else ""
+        self.stream.write(f"{prefix}{rendered}{padding}{suffix}")
         self.stream.flush()
+        self._rendered_length = len(rendered)
