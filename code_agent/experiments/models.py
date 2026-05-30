@@ -119,6 +119,7 @@ class ExperimentRunState(BaseModel):
     implementation_error_file: str | None = None
     environment_file: str | None = None
     environment_prefix: str | None = None
+    environment_cache_file: str | None = None
     hardware_file: str | None = None
     torch_runtime_file: str | None = None
     stdout_file: str | None = None

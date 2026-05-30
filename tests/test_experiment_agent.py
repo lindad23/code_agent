@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 import tomllib
@@ -7,8 +8,15 @@ from pathlib import Path
 from code_agent.experiments.agent import (
     PYTORCH_CUDA_INDEX_URL,
     HardwareProfile,
+    _environment_cache_key,
+    _environment_cache_spec,
+    _record_cached_environment,
+    _select_cached_environment,
+    _select_previous_completed_environment,
+    _configured_conda_url_channels,
     _detect_hardware,
     _install_experiment_dependencies,
+    _install_torch_runtime,
     _read_hardware_profile,
     _record_verified_runtime,
     _resolve_hardware_profile,
@@ -18,7 +26,8 @@ from code_agent.experiments.agent import (
 from code_agent.experiments.models import ExperimentRequest
 
 
-def test_base_environment_does_not_install_experiment_stack_before_torch(tmp_path):
+def test_base_environment_does_not_install_experiment_stack_before_torch(monkeypatch, tmp_path):
+    monkeypatch.setattr("code_agent.experiments.agent._configured_conda_url_channels", lambda: [])
     request = ExperimentRequest(
         baseline_url="model/id",
         benchmark_url="dataset/id",
@@ -30,6 +39,162 @@ def test_base_environment_does_not_install_experiment_stack_before_torch(tmp_pat
 
     assert "[experiment]" not in content
     assert "torch" not in content
+    assert "channels:" not in content
+
+
+def test_environment_file_uses_configured_url_channels(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "code_agent.experiments.agent._configured_conda_url_channels",
+        lambda: ["https://mirrors.example.test/anaconda/cloud/conda-forge"],
+    )
+    request = ExperimentRequest(
+        baseline_url="model/id",
+        benchmark_url="dataset/id",
+        task="train text classifier",
+        api_provider="deepseek",
+    )
+
+    content = _write_environment_file(tmp_path / "environment.yml", request).read_text(encoding="utf-8")
+
+    assert "https://mirrors.example.test/anaconda/cloud/conda-forge" in content
+    assert "nodefaults" in content
+
+
+def test_configured_conda_channels_ignore_named_official_channels(monkeypatch):
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            '{"channels": ["https://mirrors.example.test/anaconda/cloud/conda-forge", "conda-forge"]}',
+            "",
+        )
+
+    monkeypatch.setattr("code_agent.experiments.agent.subprocess.run", fake_run)
+
+    assert _configured_conda_url_channels() == ["https://mirrors.example.test/anaconda/cloud/conda-forge"]
+
+
+def test_environment_cache_records_and_selects_verified_runtime(tmp_path):
+    request = ExperimentRequest(
+        baseline_url="model/id",
+        benchmark_url="dataset/id",
+        task="train text classifier",
+        api_provider="deepseek",
+        workspace_root=tmp_path / "experiments",
+    )
+    environment_file = tmp_path / "environment.yml"
+    environment_file.write_text("dependencies:\n- python=3.11\n- pip\n- git\n", encoding="utf-8")
+    hardware = HardwareProfile(
+        accelerator="cuda",
+        torch_index_url="https://download.pytorch.org/whl/cu128",
+        torch_version="2.11.0+cu128",
+    )
+    runtime = {"torch_version": "2.11.0+cu128", "cuda_available": True}
+    spec = _environment_cache_spec(request, hardware, environment_file, runtime=runtime)
+    cache_key = _environment_cache_key(spec)
+    cache_root = tmp_path / "experiments" / "asset_cache" / "environments"
+    cache_root.mkdir(parents=True)
+    environment_prefix = cache_root / "env-existing"
+    environment_prefix.joinpath("bin").mkdir(parents=True)
+    environment_prefix.joinpath("bin", "python").write_text("#!/usr/bin/env python\n", encoding="utf-8")
+
+    metadata = _record_cached_environment(
+        cache_root,
+        environment_prefix,
+        cache_key=cache_key,
+        requested_cache_key="requested",
+        spec=spec,
+        run_id="run-1",
+        environment_file=environment_file,
+        hardware=hardware,
+        runtime=runtime,
+        reused=False,
+    )
+
+    selected = _select_cached_environment(cache_root, cache_key)
+    assert selected is not None
+    assert selected[0] == environment_prefix
+    assert selected[1]["run_id"] == "run-1"
+    assert metadata["shared_metadata_file"].endswith(".code_agent_environment.json")
+
+
+def test_environment_cache_ignores_missing_interpreter(tmp_path):
+    cache_root = tmp_path / "environments"
+    cache_root.mkdir()
+    registry = {
+        "schema_version": 1,
+        "latest": {
+            "abc": {
+                "prefix": str(cache_root / "missing-python"),
+                "run_id": "run-1",
+            }
+        },
+    }
+    cache_root.joinpath("registry.json").write_text(json.dumps(registry), encoding="utf-8")
+
+    assert _select_cached_environment(cache_root, "abc") is None
+
+
+def test_environment_cache_can_reuse_previous_completed_run(tmp_path):
+    request = ExperimentRequest(
+        baseline_url="model/id",
+        benchmark_url="dataset/id",
+        task="train text classifier",
+        api_provider="deepseek",
+        workspace_root=tmp_path / "experiments",
+        results_root=tmp_path / "results",
+    )
+    run_dir = tmp_path / "results" / "run-1"
+    run_dir.mkdir(parents=True)
+    workspace = tmp_path / "experiments" / "run-1"
+    environment_prefix = workspace / "conda-env"
+    environment_prefix.joinpath("bin").mkdir(parents=True)
+    environment_prefix.joinpath("bin", "python").write_text("#!/usr/bin/env python\n", encoding="utf-8")
+    environment_file = workspace / "environment.yml"
+    environment_file.parent.mkdir(parents=True, exist_ok=True)
+    environment_file.write_text("dependencies:\n- python=3.11\n- pip\n- git\n", encoding="utf-8")
+    hardware_file = run_dir / "hardware.json"
+    hardware_file.write_text(
+        json.dumps(
+            {
+                "accelerator": "cuda",
+                "torch_index_url": "https://download.pytorch.org/whl/cu128",
+                "torch_version": "2.11.0+cu128",
+            }
+        ),
+        encoding="utf-8",
+    )
+    runtime_file = run_dir / "torch_runtime.json"
+    runtime_file.write_text(json.dumps({"torch_version": "2.11.0+cu128"}), encoding="utf-8")
+    run_dir.joinpath("state.json").write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "run_id": "run-1",
+                "environment_prefix": str(environment_prefix),
+                "environment_file": str(environment_file),
+                "hardware_file": str(hardware_file),
+                "torch_runtime_file": str(runtime_file),
+            }
+        ),
+        encoding="utf-8",
+    )
+    spec = _environment_cache_spec(
+        request,
+        HardwareProfile(
+            accelerator="cuda",
+            torch_index_url="https://download.pytorch.org/whl/cu128",
+            torch_version="2.11.0+cu128",
+        ),
+        environment_file,
+        runtime={"torch_version": "2.11.0+cu128"},
+    )
+
+    selected = _select_previous_completed_environment(request, _environment_cache_key(spec))
+
+    assert selected is not None
+    assert selected[0] == environment_prefix
+    assert selected[1]["source"] == "previous_completed_run"
 
 
 def test_experiment_dependencies_are_installed_after_selected_torch(monkeypatch, tmp_path):
@@ -42,6 +207,39 @@ def test_experiment_dependencies_are_installed_after_selected_torch(monkeypatch,
     _install_experiment_dependencies(tmp_path, cwd=Path.cwd(), timeout=10)
 
     assert "[experiment]" in commands[0][-1]
+
+
+def test_torch_install_pins_verified_runtime_and_retries(monkeypatch, tmp_path):
+    commands = []
+    install_attempts = 0
+
+    def fake_run(command, **kwargs):
+        nonlocal install_attempts
+        commands.append(command)
+        if "install" not in command:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        install_attempts += 1
+        return subprocess.CompletedProcess(command, 0 if install_attempts == 3 else 1, "", "connection reset")
+
+    monkeypatch.setattr("code_agent.experiments.agent._run_process", fake_run)
+
+    _install_torch_runtime(
+        tmp_path,
+        HardwareProfile(
+            accelerator="cuda",
+            torch_index_url="https://download.pytorch.org/whl/cu128",
+            torch_version="2.11.0+cu128",
+        ),
+        cwd=Path.cwd(),
+        timeout=10,
+    )
+
+    install_commands = [command for command in commands if "install" in command]
+    assert len(install_commands) == 3
+    assert "torch==2.11.0+cu128" in install_commands[0]
+    assert "--retries" in install_commands[0]
+    assert "--timeout" in install_commands[0]
+    assert "--index-url" in install_commands[0]
 
 
 def test_experiment_dependencies_include_huggingface_xet_download_support():

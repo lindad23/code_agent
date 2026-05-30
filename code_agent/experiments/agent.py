@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import codecs
+import hashlib
 import json
 import os
 import re
@@ -24,6 +25,7 @@ from code_agent.tools.file_tools import ensure_dir, write_text
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ProgressCallback = Callable[[str], None]
 PYTORCH_CUDA_INDEX_URL = "https://download.pytorch.org/whl/cu128"
+TORCH_INSTALL_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -39,16 +41,210 @@ class HardwareProfile:
     verified_at: str | None = None
 
 
+def _configured_conda_url_channels() -> list[str]:
+    try:
+        result = subprocess.run(
+            ["conda", "config", "--show", "channels", "--json"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError, TimeoutError):
+        return []
+    if result.returncode != 0:
+        return []
+
+    try:
+        data = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return []
+
+    channels = data.get("channels", [])
+    if not isinstance(channels, list):
+        return []
+    return [
+        channel
+        for channel in channels
+        if isinstance(channel, str) and channel.startswith(("https://", "http://"))
+    ]
+
+
 def _write_environment_file(path: Path, request: ExperimentRequest) -> Path:
+    channels = _configured_conda_url_channels()
     environment = {
-        "channels": ["conda-forge"],
         "dependencies": [
             f"python={request.environment_python}",
             "pip",
             "git",
         ],
     }
+    if channels:
+        environment = {"channels": [*channels, "nodefaults"], **environment}
     return write_text(path, yaml.safe_dump(environment, sort_keys=False))
+
+
+def _read_environment_definition(path: Path) -> dict:
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return data if isinstance(data, dict) else {}
+
+
+def _torch_requirement_for_cache(hardware: HardwareProfile, runtime: dict | None = None) -> str:
+    version = runtime.get("torch_version") if runtime else hardware.torch_version
+    return f"torch=={version}" if version else "torch>=2.4"
+
+
+def _environment_cache_spec(
+    request: ExperimentRequest,
+    hardware: HardwareProfile,
+    environment_file: Path,
+    *,
+    runtime: dict | None = None,
+) -> dict:
+    return {
+        "schema_version": 1,
+        "environment_python": request.environment_python,
+        "environment": _read_environment_definition(environment_file),
+        "accelerator": hardware.accelerator,
+        "torch_requirement": _torch_requirement_for_cache(hardware, runtime),
+        "torch_index_url": hardware.torch_index_url if hardware.accelerator == "cuda" else None,
+    }
+
+
+def _environment_cache_key(spec: dict) -> str:
+    payload = json.dumps(spec, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def _environment_cache_root(workspace_root: Path) -> Path:
+    return ensure_dir(workspace_root / "asset_cache" / "environments")
+
+
+def _environment_registry_file(cache_root: Path) -> Path:
+    return cache_root / "registry.json"
+
+
+def _read_environment_registry(cache_root: Path) -> dict:
+    registry_file = _environment_registry_file(cache_root)
+    if not registry_file.exists():
+        return {"schema_version": 1, "latest": {}}
+    try:
+        data = json.loads(registry_file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"schema_version": 1, "latest": {}}
+    if not isinstance(data, dict):
+        return {"schema_version": 1, "latest": {}}
+    latest = data.get("latest")
+    if not isinstance(latest, dict):
+        data["latest"] = {}
+    data.setdefault("schema_version", 1)
+    return data
+
+
+def _select_cached_environment(cache_root: Path, cache_key: str) -> tuple[Path, dict] | None:
+    registry = _read_environment_registry(cache_root)
+    entry = registry.get("latest", {}).get(cache_key)
+    if not isinstance(entry, dict) or not entry.get("prefix"):
+        return None
+    prefix = Path(entry["prefix"])
+    if not _environment_python(prefix).exists():
+        return None
+    return prefix, entry
+
+
+def _select_previous_completed_environment(request: ExperimentRequest, cache_key: str) -> tuple[Path, dict] | None:
+    results_root = Path(request.results_root).expanduser()
+    if not results_root.exists():
+        return None
+    state_files = sorted(
+        results_root.glob("*/state.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for state_file in state_files:
+        try:
+            state = json.loads(state_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(state, dict) or state.get("status") != "completed":
+            continue
+        environment_prefix = Path(str(state.get("environment_prefix", "")))
+        environment_file = Path(str(state.get("environment_file", "")))
+        hardware_file = Path(str(state.get("hardware_file", "")))
+        runtime_file = Path(str(state.get("torch_runtime_file", "")))
+        if not all(path.exists() for path in (environment_file, hardware_file, runtime_file)):
+            continue
+        if not _environment_python(environment_prefix).exists():
+            continue
+        try:
+            hardware_data = json.loads(hardware_file.read_text(encoding="utf-8"))
+            runtime = json.loads(runtime_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(hardware_data, dict) or not isinstance(runtime, dict):
+            continue
+        allowed = set(HardwareProfile.__dataclass_fields__)
+        try:
+            hardware = HardwareProfile(**{key: value for key, value in hardware_data.items() if key in allowed})
+        except TypeError:
+            continue
+        previous_spec = _environment_cache_spec(request, hardware, environment_file, runtime=runtime)
+        if _environment_cache_key(previous_spec) != cache_key:
+            continue
+        return environment_prefix, {
+            "source": "previous_completed_run",
+            "run_id": state.get("run_id"),
+            "state_file": str(state_file),
+        }
+    return None
+
+
+def _record_cached_environment(
+    cache_root: Path,
+    environment_prefix: Path,
+    *,
+    cache_key: str,
+    requested_cache_key: str,
+    spec: dict,
+    run_id: str,
+    environment_file: Path,
+    hardware: HardwareProfile,
+    runtime: dict,
+    reused: bool,
+) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    metadata = {
+        "schema_version": 1,
+        "cache_key": cache_key,
+        "requested_cache_key": requested_cache_key,
+        "run_id": run_id,
+        "environment_prefix": str(environment_prefix),
+        "environment_file": str(environment_file),
+        "reused": reused,
+        "updated_at": now,
+        "spec": spec,
+        "hardware": asdict(hardware),
+        "runtime": runtime,
+    }
+    shared_metadata_file = write_text(
+        environment_prefix / ".code_agent_environment.json",
+        json.dumps(metadata, ensure_ascii=False, indent=2),
+    )
+    metadata["shared_metadata_file"] = str(shared_metadata_file)
+
+    registry = _read_environment_registry(cache_root)
+    registry.setdefault("latest", {})
+    registry["latest"][cache_key] = {
+        "prefix": str(environment_prefix),
+        "metadata_file": str(shared_metadata_file),
+        "run_id": run_id,
+        "updated_at": now,
+    }
+    write_text(_environment_registry_file(cache_root), json.dumps(registry, ensure_ascii=False, indent=2))
+    return metadata
 
 
 def _run_process(command: list[str], *, cwd: Path, timeout: int) -> subprocess.CompletedProcess[str]:
@@ -142,11 +338,38 @@ def _install_torch_runtime(
 ) -> tuple[subprocess.CompletedProcess[str], subprocess.CompletedProcess[str] | None]:
     python = str(_environment_python(environment_prefix))
     uninstall = None
-    command = [python, "-m", "pip", "install", "torch>=2.4"]
+    torch_requirement = f"torch=={hardware.torch_version}" if hardware.torch_version else "torch>=2.4"
+    command = [
+        python,
+        "-m",
+        "pip",
+        "install",
+        torch_requirement,
+        "--retries",
+        "10",
+        "--timeout",
+        "120",
+    ]
     if hardware.accelerator == "cuda":
         uninstall = _run_process([python, "-m", "pip", "uninstall", "-y", "torch"], cwd=cwd, timeout=timeout)
         command.extend(["--index-url", hardware.torch_index_url or PYTORCH_CUDA_INDEX_URL])
-    install = _run_process(command, cwd=cwd, timeout=timeout)
+    attempts: list[subprocess.CompletedProcess[str]] = []
+    for attempt in range(1, TORCH_INSTALL_ATTEMPTS + 1):
+        install = _run_process(command, cwd=cwd, timeout=timeout)
+        attempts.append(install)
+        if install.returncode == 0:
+            return install, uninstall
+
+    install = attempts[-1]
+    combined_stdout = "\n\n".join(
+        f"--- torch install attempt {index} stdout ---\n{attempt.stdout}"
+        for index, attempt in enumerate(attempts, start=1)
+    )
+    combined_stderr = "\n\n".join(
+        f"--- torch install attempt {index} stderr ---\n{attempt.stderr}"
+        for index, attempt in enumerate(attempts, start=1)
+    )
+    install = subprocess.CompletedProcess(install.args, install.returncode, combined_stdout, combined_stderr)
     return install, uninstall
 
 
@@ -341,14 +564,31 @@ def run_experiment_agent(
         )
         hardware_file = write_text(run_results / "hardware.json", json.dumps(asdict(hardware), indent=2))
         environment_file = _write_environment_file(workspace / "environment.yml", request)
-        environment_prefix = workspace / "conda-env"
+        environment_cache_root = _environment_cache_root(request.workspace_root)
+        requested_cache_spec = _environment_cache_spec(request, hardware, environment_file)
+        requested_cache_key = _environment_cache_key(requested_cache_spec)
+        cached_environment = _select_cached_environment(environment_cache_root, requested_cache_key)
+        if cached_environment is None:
+            cached_environment = _select_previous_completed_environment(request, requested_cache_key)
+        reused_cached_environment = cached_environment is not None
+        if cached_environment is not None:
+            environment_prefix = cached_environment[0]
+        else:
+            environment_prefix = environment_cache_root / f"env-{requested_cache_key}"
         state.hardware_file = str(hardware_file)
         state.environment_file = str(environment_file)
         state.environment_prefix = str(environment_prefix)
         state.status = "preparing_environment"
         write_text(run_results / "state.json", state.model_dump_json(indent=2))
 
-        if environment_prefix.exists() and request.reuse_environment:
+        if reused_cached_environment:
+            setup = subprocess.CompletedProcess(
+                ["conda", "env", "reuse", "--prefix", str(environment_prefix)],
+                0,
+                f"Reusing cached experiment environment: {environment_prefix}\n",
+                "",
+            )
+        elif environment_prefix.exists():
             setup_command = [
                 "conda",
                 "env",
@@ -359,10 +599,7 @@ def run_experiment_agent(
                 str(environment_file),
                 "--prune",
             ]
-        elif environment_prefix.exists():
-            raise FileExistsError(
-                f"Experiment environment already exists: {environment_prefix}. Use a new run name or --reuse-environment."
-            )
+            setup = _run_process(setup_command, cwd=PROJECT_ROOT, timeout=request.timeout_seconds)
         else:
             setup_command = [
                 "conda",
@@ -373,18 +610,27 @@ def run_experiment_agent(
                 "--file",
                 str(environment_file),
             ]
-        setup = _run_process(setup_command, cwd=PROJECT_ROOT, timeout=request.timeout_seconds)
+            setup = _run_process(setup_command, cwd=PROJECT_ROOT, timeout=request.timeout_seconds)
         write_text(run_results / "environment_stdout.txt", setup.stdout)
         write_text(run_results / "environment_stderr.txt", setup.stderr)
         if setup.returncode != 0:
             raise RuntimeError(f"Conda environment creation failed. See {run_results / 'environment_stderr.txt'}")
 
-        torch_install, torch_uninstall = _install_torch_runtime(
-            environment_prefix,
-            hardware,
-            cwd=PROJECT_ROOT,
-            timeout=request.timeout_seconds,
-        )
+        if reused_cached_environment:
+            torch_install = subprocess.CompletedProcess(
+                ["pip", "install", "torch", "reuse"],
+                0,
+                f"Reusing PyTorch runtime from cached environment: {environment_prefix}\n",
+                "",
+            )
+            torch_uninstall = None
+        else:
+            torch_install, torch_uninstall = _install_torch_runtime(
+                environment_prefix,
+                hardware,
+                cwd=PROJECT_ROOT,
+                timeout=request.timeout_seconds,
+            )
         torch_setup_output = (torch_uninstall.stdout if torch_uninstall else "") + torch_install.stdout
         torch_setup_error = (torch_uninstall.stderr if torch_uninstall else "") + torch_install.stderr
         write_text(run_results / "torch_install_stdout.txt", torch_setup_output)
@@ -410,6 +656,25 @@ def run_experiment_agent(
         write_text(hardware_file, json.dumps(asdict(hardware), indent=2))
         runtime_file = write_text(run_results / "torch_runtime.json", json.dumps(runtime, indent=2))
         state.torch_runtime_file = str(runtime_file)
+        actual_cache_spec = _environment_cache_spec(request, hardware, environment_file, runtime=runtime)
+        actual_cache_key = _environment_cache_key(actual_cache_spec)
+        environment_cache_metadata = _record_cached_environment(
+            environment_cache_root,
+            environment_prefix,
+            cache_key=actual_cache_key,
+            requested_cache_key=requested_cache_key,
+            spec=actual_cache_spec,
+            run_id=run_id,
+            environment_file=environment_file,
+            hardware=hardware,
+            runtime=runtime,
+            reused=reused_cached_environment,
+        )
+        environment_cache_file = write_text(
+            run_results / "environment_cache.json",
+            json.dumps(environment_cache_metadata, ensure_ascii=False, indent=2),
+        )
+        state.environment_cache_file = str(environment_cache_file)
 
         if progress_callback is not None:
             progress_callback("run_experiment")

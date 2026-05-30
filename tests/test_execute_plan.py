@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from code_agent.experiments.execute_plan import _asset_cache_dirs
+from code_agent.experiments.execute_plan import _asset_cache_dirs, _dataset_repository_patterns
 
 
 def test_asset_caches_are_shared_outside_long_run_id(tmp_path):
@@ -23,3 +23,14 @@ def test_existing_dataset_cache_is_imported_into_shared_data_folder(tmp_path):
     _, _, dataset_cache = _asset_cache_dirs(workspace)
 
     assert dataset_cache.joinpath("cached.arrow").read_text(encoding="utf-8") == "already prepared"
+
+
+def test_dataset_repository_patterns_select_config_folder():
+    assert _dataset_repository_patterns("sst2") == [
+        ".gitattributes",
+        "README*",
+        "dataset_infos.json",
+        "*.py",
+        "sst2/**",
+    ]
+    assert _dataset_repository_patterns(None) is None

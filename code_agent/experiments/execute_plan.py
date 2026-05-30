@@ -40,6 +40,18 @@ def _load_improvement_module(path: Path) -> ModuleType:
     return module
 
 
+def _dataset_repository_patterns(dataset_config: str | None) -> list[str] | None:
+    if not dataset_config:
+        return None
+    return [
+        ".gitattributes",
+        "README*",
+        "dataset_infos.json",
+        "*.py",
+        f"{dataset_config}/**",
+    ]
+
+
 def run_plan(plan: ComparisonPlan, workspace_dir: Path, results_dir: Path, implementation_file: Path) -> dict:
     try:
         import numpy as np
@@ -66,12 +78,23 @@ def run_plan(plan: ComparisonPlan, workspace_dir: Path, results_dir: Path, imple
         code_cache,
         repo_type="model",
     )
-    dataset_repo, shared_dataset_repo = stage_huggingface_repository(
-        plan.dataset_id,
-        downloads / "benchmark_repository",
-        data_repo_cache,
-        repo_type="dataset",
-    )
+    dataset_repo = downloads / "benchmark_repository"
+    shared_dataset_repo: Path | None = None
+    dataset_repository_warning: str | None = None
+    try:
+        dataset_repo, shared_dataset_repo = stage_huggingface_repository(
+            plan.dataset_id,
+            dataset_repo,
+            data_repo_cache,
+            repo_type="dataset",
+            allow_patterns=_dataset_repository_patterns(plan.dataset_config),
+        )
+    except Exception as exc:
+        dataset_repository_warning = (
+            "Dataset repository cache staging failed; continuing with datasets.load_dataset cache only.\n"
+            f"{type(exc).__name__}: {exc}"
+        )
+        write_text(results_dir / "dataset_repository_warning.txt", dataset_repository_warning)
     dataset = download_huggingface_dataset(
         plan.dataset_id,
         plan.dataset_config or "",
@@ -202,8 +225,9 @@ def run_plan(plan: ComparisonPlan, workspace_dir: Path, results_dir: Path, imple
         "model_repository": str(model_repo),
         "dataset_repository": str(dataset_repo),
         "shared_model_repository": str(shared_model_repo),
-        "shared_dataset_repository": str(shared_dataset_repo),
+        "shared_dataset_repository": str(shared_dataset_repo) if shared_dataset_repo is not None else None,
         "shared_dataset_cache": str(dataset_cache),
+        "dataset_repository_warning": dataset_repository_warning,
         "train_samples": len(train_dataset),
         "eval_samples": len(eval_dataset),
         "seed": plan.seed,
