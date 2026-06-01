@@ -12,6 +12,7 @@ from code_agent.experiments.agent import (
     _environment_cache_spec,
     _record_cached_environment,
     _select_cached_environment,
+    _select_execution_gpu,
     _select_previous_completed_environment,
     _configured_conda_url_channels,
     _detect_hardware,
@@ -267,6 +268,42 @@ def test_detect_hardware_uses_cuda_wheel_index_when_nvidia_smi_is_available(monk
     assert hardware.torch_index_url == PYTORCH_CUDA_INDEX_URL
 
 
+def test_select_execution_gpu_prefers_most_free_memory(monkeypatch):
+    def fake_run(command, **kwargs):
+        assert "--query-gpu=index,memory.free,memory.used,memory.total" in command
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            "0, 1024, 23540, 24564\n1, 22000, 2564, 24564\n2, 12000, 12564, 24564\n",
+            "",
+        )
+
+    monkeypatch.setattr("code_agent.experiments.agent._run_process", fake_run)
+
+    selected = _select_execution_gpu(HardwareProfile(accelerator="cuda"))
+
+    assert selected["selected_gpu_index"] == 1
+    assert selected["cuda_visible_devices"] == "1"
+    assert selected["free_memory_mb"] == 22000
+
+
+def test_select_execution_gpu_respects_existing_numeric_visibility(monkeypatch):
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            "0, 24000, 564, 24564\n4, 10000, 14564, 24564\n5, 18000, 6564, 24564\n",
+            "",
+        )
+
+    monkeypatch.setattr("code_agent.experiments.agent._run_process", fake_run)
+
+    selected = _select_execution_gpu(HardwareProfile(accelerator="cuda"), cuda_visible_devices="4,5")
+
+    assert selected["selected_gpu_index"] == 5
+    assert selected["cuda_visible_devices"] == "5"
+
+
 def test_cached_hardware_profile_skips_detection(monkeypatch, tmp_path):
     profile_file = tmp_path / "hardware_profile.local.yaml"
     profile_file.write_text(
@@ -360,3 +397,21 @@ def test_streaming_process_preserves_carriage_return_progress_updates(tmp_path):
     assert "\nstep 2/2" not in rendered
     with stderr_file.open("r", encoding="utf-8", newline="") as progress_log:
         assert progress_log.read() == rendered
+
+
+def test_streaming_process_applies_environment_overrides(tmp_path):
+    stdout_file = tmp_path / "experiment_stdout.txt"
+    stderr_file = tmp_path / "experiment_stderr.txt"
+
+    completed = _run_process_streaming(
+        [sys.executable, "-c", "import os; print(os.environ.get('CUDA_VISIBLE_DEVICES'))"],
+        cwd=Path.cwd(),
+        timeout=10,
+        stdout_file=stdout_file,
+        stderr_file=stderr_file,
+        relay_stream=None,
+        env_overrides={"CUDA_VISIBLE_DEVICES": "5"},
+    )
+
+    assert completed.returncode == 0
+    assert stdout_file.read_text(encoding="utf-8").strip() == "5"

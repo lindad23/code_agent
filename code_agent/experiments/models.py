@@ -27,9 +27,12 @@ class ExperimentRequest(BaseModel):
 class TrainingVariant(BaseModel):
     method: Literal["baseline", "improved"]
     main_change: str
+    strategy: str | None = None
+    k: int | None = Field(default=None, gt=0)
     learning_rate: float = Field(default=2e-5, gt=0, le=1)
     train_batch_size: int = Field(default=16, gt=0, le=1024)
     eval_batch_size: int = Field(default=32, gt=0, le=1024)
+    gradient_accumulation_steps: int = Field(default=1, gt=0, le=1024)
     num_train_epochs: float = Field(default=3.0, gt=0, le=100)
     weight_decay: float = Field(default=0.01, ge=0, le=10)
     warmup_ratio: float = Field(default=0.0, ge=0, le=1)
@@ -83,6 +86,7 @@ class ComparisonPlan(BaseModel):
                 "learning_rate",
                 "train_batch_size",
                 "eval_batch_size",
+                "gradient_accumulation_steps",
                 "num_train_epochs",
                 "weight_decay",
                 "warmup_ratio",
@@ -112,6 +116,8 @@ class ExperimentRunState(BaseModel):
     plan_prompt_file: str | None = None
     plan_response_file: str | None = None
     plan_error_file: str | None = None
+    study_plan_file: str | None = None
+    expanded_cells_file: str | None = None
     implementation_prompt_file: str | None = None
     implementation_response_file: str | None = None
     implementation_file: str | None = None
@@ -131,3 +137,154 @@ class ExperimentRunState(BaseModel):
 
 def default_run_id() -> str:
     return "experiment-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+class StudyMode(BaseModel):
+    seeds: list[int] = Field(min_length=1)
+    max_train_samples: int | None = Field(default=None, gt=0)
+    max_eval_samples: int | None = Field(default=None, gt=0)
+    num_train_epochs: float = Field(default=3.0, gt=0, le=100)
+    train_batch_size: int = Field(default=32, gt=0, le=1024)
+    eval_batch_size: int = Field(default=64, gt=0, le=1024)
+    learning_rate: float = Field(default=2e-5, gt=0, le=1)
+    weight_decay: float = Field(default=0.01, ge=0, le=10)
+    warmup_ratio: float = Field(default=0.0, ge=0, le=1)
+    label_smoothing_factor: float = Field(default=0.0, ge=0, lt=1)
+
+    @field_validator("seeds")
+    @classmethod
+    def validate_unique_seeds(cls, value: list[int]) -> list[int]:
+        if len(set(value)) != len(value):
+            raise ValueError("Study mode seeds cannot contain duplicates.")
+        return value
+
+
+class BenchmarkSpec(BaseModel):
+    name: str = Field(min_length=1)
+    dataset_config: str = Field(min_length=1)
+    text_columns: list[str] = Field(min_length=1, max_length=2)
+    label_column: str = "label"
+    train_split: str = "train"
+    eval_split: str = "validation"
+    metrics: list[Literal["accuracy", "f1"]] = Field(default_factory=lambda: ["accuracy"], min_length=1)
+    num_labels: int | None = Field(default=None, gt=1)
+    max_length: int = Field(default=128, gt=0, le=4096)
+
+    @field_validator("text_columns")
+    @classmethod
+    def validate_unique_text_columns(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("Benchmark text_columns cannot contain duplicates.")
+        return value
+
+    @field_validator("metrics")
+    @classmethod
+    def validate_unique_metrics(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("Benchmark metrics cannot contain duplicates.")
+        return value
+
+
+class VariantSpec(BaseModel):
+    name: str = Field(min_length=1)
+    family: Literal["baseline", "improved"]
+    main_change: str
+    strategy: str | None = None
+    k: int | None = Field(default=None, gt=0)
+    implementation_notes: str | None = None
+
+    @field_validator("family", mode="before")
+    @classmethod
+    def normalize_family(cls, value):
+        if not isinstance(value, str):
+            return value
+        normalized = value.strip().lower()
+        if normalized in {"ablation", "variant", "fusion", "treatment", "experiment"}:
+            return "improved"
+        if normalized in {"control", "baseline"}:
+            return "baseline"
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_variant(self) -> "VariantSpec":
+        if self.family == "baseline" and self.main_change.strip().lower() != "none":
+            raise ValueError("Baseline study variants must use main_change='none'.")
+        if self.family == "improved" and self.main_change.strip().lower() == "none":
+            raise ValueError("Improved study variants must name their code change.")
+        return self
+
+
+class ResourceLoggingSpec(BaseModel):
+    record_wall_time: bool = True
+    record_train_runtime: bool = True
+    record_eval_runtime: bool = True
+    record_samples_per_second: bool = True
+    record_max_gpu_memory: bool = True
+    record_gpu_name: bool = True
+
+
+class LaunchSpec(BaseModel):
+    strategy: Literal["serial", "gpu_worker_pool", "torchrun", "accelerate"] = "serial"
+    preferred_parallelism: str | None = None
+    max_concurrent_runs: int | None = Field(default=None, gt=0)
+
+
+class FailurePolicySpec(BaseModel):
+    preflight_tiny_run: bool = True
+    retry_once: bool = True
+    on_oom: Literal["fail", "halve_batch_size", "halve_batch_size_and_use_gradient_accumulation"] = (
+        "halve_batch_size_and_use_gradient_accumulation"
+    )
+    write_failure_signature: bool = True
+
+
+class ExperimentStudyPlan(BaseModel):
+    model_id: str
+    dataset_id: str
+    task_type: Literal["sequence_classification"]
+    modes: dict[str, StudyMode] = Field(min_length=1)
+    benchmarks: list[BenchmarkSpec] = Field(min_length=1)
+    variants: list[VariantSpec] = Field(min_length=2)
+    implementation: ImprovementSpec
+    resource_logging: ResourceLoggingSpec = Field(default_factory=ResourceLoggingSpec)
+    launch: LaunchSpec = Field(default_factory=LaunchSpec)
+    failure_policy: FailurePolicySpec = Field(default_factory=FailurePolicySpec)
+    result_table_columns: list[str] = Field(default_factory=list)
+    rationale: str = ""
+
+    @model_validator(mode="after")
+    def validate_study(self) -> "ExperimentStudyPlan":
+        if len(set(self.modes)) != len(self.modes):
+            raise ValueError("Study mode names cannot contain duplicates.")
+        benchmark_names = [benchmark.name for benchmark in self.benchmarks]
+        if len(set(benchmark_names)) != len(benchmark_names):
+            raise ValueError("Study benchmark names cannot contain duplicates.")
+        variant_names = [variant.name for variant in self.variants]
+        if len(set(variant_names)) != len(variant_names):
+            raise ValueError("Study variant names cannot contain duplicates.")
+        if not any(variant.family == "baseline" for variant in self.variants):
+            raise ValueError("Study plans must include at least one baseline variant.")
+        if not any(variant.family == "improved" for variant in self.variants):
+            raise ValueError("Study plans must include at least one improved variant.")
+        return self
+
+
+class ExecutionCell(BaseModel):
+    mode: str
+    benchmark: str
+    dataset_config: str
+    text_columns: list[str] = Field(min_length=1, max_length=2)
+    label_column: str = "label"
+    train_split: str = "train"
+    eval_split: str = "validation"
+    metrics: list[Literal["accuracy", "f1"]] = Field(default_factory=lambda: ["accuracy"], min_length=1)
+    num_labels: int | None = Field(default=None, gt=1)
+    max_length: int = Field(default=128, gt=0, le=4096)
+    seed: int
+    variant: str
+    family: Literal["baseline", "improved"]
+    strategy: str | None = None
+    k: int | None = Field(default=None, gt=0)
+    max_train_samples: int | None = Field(default=None, gt=0)
+    max_eval_samples: int | None = Field(default=None, gt=0)
+    training: TrainingVariant

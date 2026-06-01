@@ -16,7 +16,11 @@ from typing import BinaryIO, Callable, TextIO
 
 import yaml
 
-from code_agent.experiments.implementer import build_implementation_prompt, request_implementation
+from code_agent.experiments.implementer import (
+    ImplementationGenerationError,
+    build_implementation_prompt,
+    request_implementation,
+)
 from code_agent.experiments.models import ExperimentRequest, ExperimentRunState, default_run_id
 from code_agent.experiments.planner import prepare_plan_request, request_experiment_plan
 from code_agent.tools.file_tools import ensure_dir, write_text
@@ -39,6 +43,14 @@ class HardwareProfile:
     torch_cuda_version: str | None = None
     verified_device_name: str | None = None
     verified_at: str | None = None
+
+
+@dataclass(frozen=True)
+class GpuMemorySnapshot:
+    index: int
+    free_memory_mb: int
+    used_memory_mb: int
+    total_memory_mb: int
 
 
 def _configured_conda_url_channels() -> list[str]:
@@ -260,17 +272,39 @@ def _run_process(command: list[str], *, cwd: Path, timeout: int) -> subprocess.C
     )
 
 
+def _run_nvidia_smi(command: list[str], *, timeout: int = 10) -> subprocess.CompletedProcess[str]:
+    result = _run_process(command, cwd=PROJECT_ROOT, timeout=timeout)
+    if result.returncode == 0:
+        return result
+    environment = os.environ.copy()
+    environment.pop("LD_LIBRARY_PATH", None)
+    try:
+        fallback = subprocess.run(
+            command,
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+            env=environment,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError, TimeoutError):
+        return result
+    return fallback if fallback.returncode == 0 else result
+
+
 def _detect_hardware() -> HardwareProfile:
     try:
-        result = _run_process(["nvidia-smi"], cwd=PROJECT_ROOT, timeout=10)
+        result = _run_nvidia_smi(["nvidia-smi"], timeout=10)
     except (FileNotFoundError, subprocess.SubprocessError):
         return HardwareProfile(accelerator="cpu")
     if result.returncode != 0:
         return HardwareProfile(accelerator="cpu")
 
-    details = _run_process(
+    details = _run_nvidia_smi(
         ["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"],
-        cwd=PROJECT_ROOT,
         timeout=10,
     )
     detail_parts = [part.strip() for part in details.stdout.splitlines()[0].split(",")] if details.stdout.strip() else []
@@ -283,6 +317,83 @@ def _detect_hardware() -> HardwareProfile:
         reported_cuda_version=cuda_match.group(1) if cuda_match else None,
         torch_index_url=PYTORCH_CUDA_INDEX_URL,
     )
+
+
+def _parse_gpu_memory_snapshot(row: str) -> GpuMemorySnapshot | None:
+    parts = [part.strip() for part in row.split(",")]
+    if len(parts) != 4:
+        return None
+    try:
+        return GpuMemorySnapshot(
+            index=int(parts[0]),
+            free_memory_mb=int(parts[1]),
+            used_memory_mb=int(parts[2]),
+            total_memory_mb=int(parts[3]),
+        )
+    except ValueError:
+        return None
+
+
+def _query_gpu_memory_snapshots() -> list[GpuMemorySnapshot]:
+    try:
+        result = _run_nvidia_smi(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.free,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0:
+        return []
+    snapshots: list[GpuMemorySnapshot] = []
+    for line in result.stdout.splitlines():
+        snapshot = _parse_gpu_memory_snapshot(line)
+        if snapshot is not None:
+            snapshots.append(snapshot)
+    return snapshots
+
+
+def _visible_gpu_indices(value: str | None) -> set[int] | None:
+    if value is None or not value.strip():
+        return None
+    indices: set[int] = set()
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if not part.isdigit():
+            return None
+        indices.add(int(part))
+    return indices or None
+
+
+def _select_execution_gpu(hardware: HardwareProfile, *, cuda_visible_devices: str | None = None) -> dict | None:
+    if hardware.accelerator != "cuda":
+        return None
+    snapshots = _query_gpu_memory_snapshots()
+    if not snapshots:
+        return None
+
+    visible_indices = _visible_gpu_indices(cuda_visible_devices)
+    candidates = [
+        snapshot
+        for snapshot in snapshots
+        if visible_indices is None or snapshot.index in visible_indices
+    ]
+    if not candidates:
+        candidates = snapshots
+    selected = max(candidates, key=lambda item: (item.free_memory_mb, -item.used_memory_mb, -item.index))
+    return {
+        "selected_gpu_index": selected.index,
+        "cuda_visible_devices": str(selected.index),
+        "free_memory_mb": selected.free_memory_mb,
+        "used_memory_mb": selected.used_memory_mb,
+        "total_memory_mb": selected.total_memory_mb,
+        "selection_policy": "max_free_memory_mb",
+    }
 
 
 def _read_hardware_profile(path: str | Path) -> HardwareProfile | None:
@@ -438,9 +549,12 @@ def _run_process_streaming(
     stdout_file: Path,
     stderr_file: Path,
     relay_stream: TextIO | None = sys.stderr,
+    env_overrides: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment["PYTHONUNBUFFERED"] = "1"
+    if env_overrides:
+        environment.update(env_overrides)
     process = subprocess.Popen(
         command,
         cwd=cwd,
@@ -540,6 +654,25 @@ def run_experiment_agent(
                 plan,
                 prompt=implementation_prompt,
             )
+        except ImplementationGenerationError as exc:
+            if exc.responses:
+                implementation_response_file = write_text(
+                    run_results / "implementation_response.txt",
+                    "\n\n".join(
+                        f"===== attempt {index} =====\n{response}"
+                        for index, response in enumerate(exc.responses, start=1)
+                    ),
+                )
+                state.implementation_response_file = str(implementation_response_file)
+            if exc.sources:
+                write_text(run_results / "implementation_invalid.py", exc.sources[-1])
+            implementation_error_file = write_text(
+                run_results / "implementation_api_error.txt",
+                "\n".join(exc.errors) if exc.errors else str(exc),
+            )
+            state.implementation_error_file = str(implementation_error_file)
+            write_text(run_results / "state.json", state.model_dump_json(indent=2))
+            raise
         except Exception as exc:
             implementation_error_file = write_text(run_results / "implementation_api_error.txt", str(exc))
             state.implementation_error_file = str(implementation_error_file)
@@ -682,6 +815,11 @@ def run_experiment_agent(
         write_text(run_results / "state.json", state.model_dump_json(indent=2))
         stdout_file = run_results / "experiment_stdout.txt"
         stderr_file = run_results / "experiment_stderr.txt"
+        gpu_selection = _select_execution_gpu(hardware, cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"))
+        env_overrides = None
+        if gpu_selection is not None:
+            write_text(run_results / "gpu_selection.json", json.dumps(gpu_selection, ensure_ascii=False, indent=2))
+            env_overrides = {"CUDA_VISIBLE_DEVICES": str(gpu_selection["cuda_visible_devices"])}
         execute = _run_process_streaming(
             [
                 str(_environment_python(environment_prefix)),
@@ -700,6 +838,7 @@ def run_experiment_agent(
             timeout=request.timeout_seconds,
             stdout_file=stdout_file,
             stderr_file=stderr_file,
+            env_overrides=env_overrides,
         )
         state.stdout_file = str(stdout_file)
         state.stderr_file = str(stderr_file)
