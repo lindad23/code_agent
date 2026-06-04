@@ -1,87 +1,195 @@
 # Code Agent
 
-一个面向 Hugging Face 文本分类实验的轻量 Code Agent。
+Code Agent 是一个由 AI 参与实验设计、代码实现和自 debug 的通用实验执行框架。当前推荐入口是从 `inputs.json` 读取任务，而不是在 CLI 中堆很多参数。
 
-你在 `--task` 中指定需要验证的算法修改，Agent 会：
+它的核心边界是：
 
-1. 解析模型、数据集和对比设置。
-2. 生成仅用于 `improved` 分支的实现代码。
-3. 在相同数据集、指标、训练参数和 seed 下运行 `baseline` 与 `improved`。
-4. 保存生成代码、训练日志、指标与对比报告。
+- AI 负责理解任务、规划实验、生成实验入口代码、生成实验执行表，并在失败后修复代码或执行 spec。
+- 本地 pipeline 负责资源准备、缓存、环境创建/复用、CUDA/PyTorch 验证、GPU 调度、真实性校验、执行 cell 和汇总结果。
 
-当前实验执行器支持 Hugging Face sequence classification，例如 DistilBERT 在 GLUE/SST-2 上的微调对比。
+也就是说，它不是固定写死某一个任务的执行器；但也不是把所有事情完全交给 API 裸跑。AI 生成的内容会被本地模板、校验器和执行器约束。
+
+## 当前架构
+
+标准流程如下：
+
+```text
+inputs.json
+  -> 解析任务配置
+  -> 创建唯一 run_id、results 目录和 workspace
+  -> 检查/初始化资源 cache
+  -> materialize baseline / benchmark 资源
+  -> API 生成实验规划
+  -> API 生成执行 spec、my_main.py 和 experiment_table
+  -> 本地校验是否真实资源驱动，拒绝 dummy/synthetic/stand-in baseline
+  -> 创建或复用 conda 实验环境
+  -> 验证 PyTorch/CUDA runtime
+  -> 按 experiment_table 执行实验 cell
+  -> 如失败，调用 API self-debug 并重试
+  -> 汇总 metrics、日志和 report
+```
+
+API 参与的阶段：
+
+- `request_generic_experiment_plan`: 生成实验规划。
+- `request_generic_execution_spec`: 生成 `my_main.py`、依赖安装命令和 `experiment_table`。
+- `request_generic_debug_execution_spec`: 根据 stderr/stdout、失败摘要和上一次 spec 生成修复版。
+
+本地 pipeline 固定负责：
+
+- `inputs.json` 解析和 run 命名。
+- 资源 clone/download/copy 与 `asset_cache` 复用。
+- execution template 生成。
+- dummy/synthetic/preflight/baseline stand-in 校验。
+- conda 环境创建或复用。
+- PyTorch CUDA 自动适配与验证。
+- GPU 贪心调度。
+- cell 执行、output JSON contract 检查和 metrics 汇总。
 
 ## 安装
 
 推荐使用 Python 3.11 和 Conda：
 
-```powershell
+```bash
 conda create -n code-agent python=3.11 -y
 conda activate code-agent
 pip install -r requirements.txt
 ```
 
-在 `.env` 中配置 API Key：
+配置 API Key：
 
-```env
-DEEPSEEK_API_KEY=your_key_here
+```bash
+export DEEPSEEK_API_KEY=your_key_here
 # 或
-OPENAI_API_KEY=your_key_here
+export OPENAI_API_KEY=your_key_here
 ```
 
-## 运行实验
+## inputs.json
 
-以下示例要求 AI 在 `improved` 中实现 focal loss，并与原始 baseline 对比：
+推荐使用仓库根目录下的 `inputs.json` 作为唯一任务输入。当前支持字段如下：
 
-```powershell
-python -m code_agent.experiment_main --baseline-url https://huggingface.co/distilbert/distilbert-base-uncased --benchmark-url https://huggingface.co/datasets/nyu-mll/glue --task "在相同 DistilBERT、GLUE/SST-2、validation accuracy、训练设置和 seed 下，保留 baseline；在 improved 中实现 focal loss（gamma=2.0）替换普通 cross entropy loss；分别训练并输出 accuracy 对比结果。" -api deepseek
+```json
+{
+  "Experience name": "optional experiment name prefix",
+  "Improved idea": "required detailed description of the algorithm idea",
+  "Baselines url": {
+    "baseline_name": "https://example.com/baseline-repo-or-resource"
+  },
+  "Benchmarks url": {
+    "benchmark_name": "https://example.com/benchmark-repo-or-resource"
+  },
+  "Evaluation indexs": "optional metrics and reporting requirements",
+  "Ablation": "True"
+}
 ```
 
-只生成实验计划，不生成代码或启动训练：
+字段说明：
 
-```powershell
-python -m code_agent.experiment_main --baseline-url https://huggingface.co/distilbert/distilbert-base-uncased --benchmark-url https://huggingface.co/datasets/nyu-mll/glue --task "在 improved 中实现 focal loss（gamma=2.0），并与 baseline 对比 validation accuracy。" -api deepseek --plan-only
+- `Experience name`: 可以为空。非空时会作为自动 run name 的前缀，保证不同实验命名更容易识别。
+- `Improved idea`: 不可为空。写清楚要验证的算法改进、关键模块、训练方式和对比目标。
+- `Baselines url`: 对象。每个 key 是 baseline 名称，不可为空；value 是 URL、repo id 或本地资源路径。value 为空时由 AI 在规划阶段提出可行资源。
+- `Benchmarks url`: 对象。每个 key 是 benchmark/dataset 名称，不可为空；value 是 URL、repo id 或本地资源路径。value 为空时由 AI 在规划阶段提出可行资源。
+- `Evaluation indexs`: 可以为空。非空时表示必须报告的指标，例如 accuracy、MSE、MAE、运行时间、显存、延迟等。为空时由 AI 选择适合任务的指标。
+- `Ablation`: 是否要求 AI 在实验规划中加入消融实验。可写 `True/False`、`yes/no`、`是/否`。
+- `API`: 可选，默认 `deepseek`。
+- `Model`: 可选，用来覆盖默认 LLM model。
+- `Study mode`: 可选，默认 `full`。
+
+注意：
+
+- 如果资源 value 是用户明确写入的网址或路径，系统会优先使用该资源；失败时会报错，不会静默替换成别的资源。
+- 如果资源 value 为空，AI 可以在规划阶段建议可行资源。
+- `Evaluation indexs` 这个字段名当前按代码保留了原拼写。
+
+## 启动方式
+
+标准运行：
+
+```bash
+python -m code_agent.experiment_main --input inputs.json
+```
+
+只生成规划和执行 spec，不真正运行实验：
+
+```bash
+python -m code_agent.experiment_main --input inputs.json --plan-only
 ```
 
 常用参数：
 
 ```text
---model MODEL                指定规划与实现使用的 LLM
---run-name NAME              指定运行名称
---reuse-environment          复用同名实验环境
---refresh-hardware-profile   重新检测本机 GPU/CUDA 配置
---no-progress                关闭 CLI 进度显示
+--model MODEL                覆盖规划/实现/debug 使用的 LLM model
+--workspace-root PATH        workspace 根目录，默认 ./workspaces/experiments
+--results-root PATH          结果根目录，默认 ./results/experiments
+--python-version VERSION     实验 conda 环境 Python 版本，默认 3.11
+--timeout-seconds SECONDS    环境安装和实验执行总超时
+--plan-timeout-seconds SEC   单次 API 规划/代码生成超时
+--hardware-profile PATH      本机 GPU/CUDA 配置缓存文件
+--refresh-hardware-profile   重新检测 GPU/CUDA 并更新硬件配置
+--no-progress                关闭 CLI 进度条
 ```
 
 ## 输出与缓存
 
-每次运行的结果写入：
+每次运行会写入：
 
 ```text
 results/experiments/<run-id>/
-  plan.json
-  improvement.py
-  comparison.md
-  metrics.json
-  experiment_stdout.txt
-  experiment_stderr.txt
+  request.json
+  generic_plan.json
+  generic_plan_prompt.md
+  generic_plan_response.txt
+  generic_execution_template.json
+  generic_execution_spec.json
+  generic_execution_prompt.md
+  generic_execution_response.txt
+  generic_debug_*                  # 如触发 self-debug
+  generic_generated_files_*.json
+  generic_experiment_table_*.json
+  generic_experiment_cells_*/      # 每个 cell 的 input/output JSON
+  generic_metrics.json
+  generic_execution_summary.json
+  environment_cache.json
+  torch_runtime.json
+  state.json
 ```
 
-实际执行的 AI 实现代码位于：
+运行 workspace 会写入：
 
 ```text
-workspaces/experiments/<run-id>/generated/improvement.py
+workspaces/experiments/<run-id>/
+  resources/       # 本次实验使用的 materialized resources
+  my_main.py       # API 生成的实验入口，或其他生成文件
+  environment.yml
 ```
 
-模型与数据仓库会缓存到 `workspaces/experiments/asset_cache/`，实验环境会复用本机 GPU 对应的 PyTorch/CUDA 配置。实验依赖包含 `hf_xet`，以提升 Hugging Face Xet Storage 下载性能。
+共享缓存：
 
-## 其他入口
+```text
+workspaces/experiments/asset_cache/resources      # repo/dataset/resource cache
+workspaces/experiments/asset_cache/environments  # conda env cache
+```
 
-项目仍保留通用代码仓库修补入口 `python -m code_agent.main`，用于 clone 仓库、运行测试、生成并可选应用 patch；当前主要开发方向为 `code_agent.experiment_main` 实验流程。
+如果只想清理历史运行产物但保留资源 cache，可以删除 `results/experiments/*`，并删除 `workspaces/experiments/` 下除 `asset_cache` 外的目录。
+
+## 真实性校验
+
+generic backend 会在执行前检查 API 生成的 spec，拒绝常见不可信实现：
+
+- dummy baseline。
+- synthetic/random training data。
+- placeholder metrics。
+- preflight/smoke-only workflow。
+- 用手写同名 wrapper 替代 materialized baseline repo。
+- experiment table record 中反复写绝对路径或超大矩阵。
+
+如果校验或执行失败，系统会把失败摘要、stdout/stderr tail、上一版 spec、资源信息和接口摘要交给 API 进行 self-debug。
 
 ## 测试
 
-```powershell
+```bash
 conda activate code-agent
 python -m pytest -q
 ```
+
+`tests/` 不是正式实验运行依赖，但它保存了输入解析、资源 cache、环境复用、GPU 调度、dummy 校验、JSON 修复和 self-debug 的回归测试，建议保留。
