@@ -1,5 +1,21 @@
 # `code_agent.experiment_main`
 
+推荐使用仓库根目录的 `inputs.json` 作为统一运行入口：
+
+```powershell
+python -m code_agent.experiment_main --input inputs.json
+```
+
+`inputs.json` 字段约定：
+
+- `Experience name` 可为空；非空时作为自动生成实验目录名前缀，例如 `<Experience name>-experiment-...`。
+- `Improved idea` 不可为空，写入改进算法的详细描述。
+- `Baselines url` / `Benchmarks url` 是对象，key 是非空资源名，value 是 Hugging Face URL、repo id 或资源地址。value 为空时由 AI 根据资源名解析可行资源；value 非空时优先固定使用该资源。
+- `Evaluation indexs` 可为空；为空时由 AI 选择合适指标和运行资源统计。
+- `Ablation` 为 true 时默认生成并执行 `full` study 矩阵；为 false 时执行单个 baseline-vs-improved 实验。
+
+旧 CLI 参数仍保留用于兼容：
+
 该命令要求在 `--task` 中写明要验证的算法或代码改动。AI 只负责将指定改动实现为 `improved` 代码，然后在相同模型、数据集、验证指标和训练设置下运行 `baseline` 与 `improved` 对比。
 
 例如，明确要求实现 focal loss：

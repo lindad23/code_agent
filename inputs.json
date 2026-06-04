@@ -1,0 +1,14 @@
+{
+  "Experience name": "Long-Term Time Series Forecasting: DLinear/PatchTST on ETTm1-ETTh1-Weather with Frequency-aware Residual Calibration",
+  "Improved idea": "提出 Frequency-aware Residual Calibration, 简称 FRC。核心思路是在原始 baseline 输出之外增加一个轻量残差校正模块：1) 使用 RevIN 对每个样本做 instance-level normalization，缓解不同时间段分布漂移；2) 对输入窗口做 FFT，提取 top-k 主频分量，用可学习幅值和相位外推未来周期残差；3) 用一个 gated fusion 模块融合 baseline prediction 和 frequency residual prediction；4) 训练时加入 temporal masking consistency loss，即随机 mask 一部分历史窗口，要求原始输入和扰动输入的预测结果保持一致。该方法不替换 baseline 主干，只是在 DLinear 和 PatchTST 后面加一个通用 residual head，适合 code agent 自动改代码、跑对比和做消融。",
+  "Baselines url": {
+    "DLinear_LTSF_Linear": "https://github.com/cure-lab/LTSF-Linear",
+    "PatchTST_supervised": "https://github.com/yuqinie98/PatchTST"
+  },
+  "Benchmarks url": {
+    "ETTm1": "https://github.com/zhouhaoyi/ETDataset",
+    "ETTh1": "https://github.com/zhouhaoyi/ETDataset"
+  },
+  "Evaluation indexs": "Main metrics: MSE and MAE under prediction lengths 96, 192, 336, and 720. Report per-dataset/per-horizon MSE and MAE, average MSE/MAE across all settings, training time, peak GPU memory, and inference latency. Primary comparison should use the same input length, same train/val/test split, same random seed, and 3 repeated runs.",
+  "Ablation": "True"
+}

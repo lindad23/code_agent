@@ -26,7 +26,7 @@ from code_agent.experiments.agent import (
     _write_environment_file,
 )
 from code_agent.experiments.implementer import build_implementation_prompt, request_implementation
-from code_agent.experiments.models import ExperimentRequest, ExperimentRunState, default_run_id
+from code_agent.experiments.models import ExperimentRequest, ExperimentRunState, default_run_id, unique_run_id
 from code_agent.experiments.planner import PlanValidationError, prepare_study_plan_request, request_experiment_study_plan
 from code_agent.experiments.study import comparison_plan_for_variant, expand_study_plan
 from code_agent.tools.file_tools import ensure_dir, write_text
@@ -37,7 +37,7 @@ def run_study_planning_agent(
     *,
     progress_callback=None,
 ) -> ExperimentRunState:
-    run_id = request.run_name or default_run_id()
+    run_id = unique_run_id(request.run_name) if request.run_name_is_prefix else request.run_name or default_run_id()
     workspace = ensure_dir(request.workspace_root / run_id)
     ensure_dir(workspace / "generated")
     run_results = ensure_dir(request.results_root / run_id)

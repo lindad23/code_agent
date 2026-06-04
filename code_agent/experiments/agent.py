@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -21,7 +22,7 @@ from code_agent.experiments.implementer import (
     build_implementation_prompt,
     request_implementation,
 )
-from code_agent.experiments.models import ExperimentRequest, ExperimentRunState, default_run_id
+from code_agent.experiments.models import ExperimentRequest, ExperimentRunState, default_run_id, unique_run_id
 from code_agent.experiments.planner import prepare_plan_request, request_experiment_plan
 from code_agent.tools.file_tools import ensure_dir, write_text
 
@@ -29,6 +30,14 @@ from code_agent.tools.file_tools import ensure_dir, write_text
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ProgressCallback = Callable[[str], None]
 PYTORCH_CUDA_INDEX_URL = "https://download.pytorch.org/whl/cu128"
+PYTORCH_CUDA_INDEX_BY_DRIVER_CUDA: tuple[tuple[tuple[int, int], str], ...] = (
+    ((13, 0), "https://download.pytorch.org/whl/cu130"),
+    ((12, 8), "https://download.pytorch.org/whl/cu128"),
+    ((12, 6), "https://download.pytorch.org/whl/cu126"),
+    ((12, 4), "https://download.pytorch.org/whl/cu124"),
+    ((12, 1), "https://download.pytorch.org/whl/cu121"),
+    ((11, 8), "https://download.pytorch.org/whl/cu118"),
+)
 TORCH_INSTALL_ATTEMPTS = 3
 
 
@@ -122,7 +131,7 @@ def _environment_cache_spec(
         "environment": _read_environment_definition(environment_file),
         "accelerator": hardware.accelerator,
         "torch_requirement": _torch_requirement_for_cache(hardware, runtime),
-        "torch_index_url": hardware.torch_index_url if hardware.accelerator == "cuda" else None,
+        "torch_index_url": _torch_index_url_for_hardware(hardware) if hardware.accelerator == "cuda" else None,
     }
 
 
@@ -272,6 +281,100 @@ def _run_process(command: list[str], *, cwd: Path, timeout: int) -> subprocess.C
     )
 
 
+def _requested_python_matches_current(request: ExperimentRequest) -> bool:
+    match = re.match(r"^\s*([0-9]+)(?:\.([0-9]+))?", str(request.environment_python))
+    if not match:
+        return False
+    major = int(match.group(1))
+    minor = int(match.group(2) or sys.version_info.minor)
+    return (sys.version_info.major, sys.version_info.minor) == (major, minor)
+
+
+def _current_torch_runtime_for_hardware(
+    hardware: HardwareProfile,
+    *,
+    cwd: Path,
+    timeout: int,
+) -> dict | None:
+    inspect = _run_process(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, torch; "
+                "print(json.dumps({'torch_version': torch.__version__, "
+                "'cuda_available': torch.cuda.is_available(), "
+                "'torch_cuda_version': torch.version.cuda, "
+                "'device_name': torch.cuda.get_device_name(0) if torch.cuda.is_available() else None}))"
+            ),
+        ],
+        cwd=cwd,
+        timeout=min(timeout, 120),
+    )
+    if inspect.returncode != 0:
+        return None
+    try:
+        runtime = json.loads(inspect.stdout.strip())
+    except json.JSONDecodeError:
+        return None
+    if hardware.accelerator == "cuda" and not runtime.get("cuda_available"):
+        return None
+    if hardware.torch_version and runtime.get("torch_version") != hardware.torch_version:
+        return None
+    if hardware.torch_cuda_version and runtime.get("torch_cuda_version") != hardware.torch_cuda_version:
+        return None
+    return runtime
+
+
+def _is_safe_environment_cache_prefix(environment_prefix: Path, cache_root: Path) -> bool:
+    try:
+        environment_prefix.resolve().relative_to(cache_root.resolve())
+    except ValueError:
+        return False
+    return environment_prefix.name.startswith("env-")
+
+
+def _try_clone_current_environment(
+    request: ExperimentRequest,
+    hardware: HardwareProfile,
+    *,
+    environment_prefix: Path,
+    cache_root: Path,
+    cwd: Path,
+    timeout: int,
+) -> tuple[subprocess.CompletedProcess[str], dict] | None:
+    current_prefix = Path(sys.prefix).resolve()
+    if current_prefix == environment_prefix.resolve():
+        return None
+    if not _requested_python_matches_current(request):
+        return None
+    runtime = _current_torch_runtime_for_hardware(hardware, cwd=cwd, timeout=timeout)
+    if runtime is None:
+        return None
+    if not _is_safe_environment_cache_prefix(environment_prefix, cache_root):
+        return None
+    if environment_prefix.exists():
+        shutil.rmtree(environment_prefix)
+    clone = _run_process(
+        [
+            "conda",
+            "create",
+            "--yes",
+            "--prefix",
+            str(environment_prefix),
+            "--clone",
+            str(current_prefix),
+        ],
+        cwd=cwd,
+        timeout=timeout,
+    )
+    if clone.returncode != 0:
+        if environment_prefix.exists() and _is_safe_environment_cache_prefix(environment_prefix, cache_root):
+            shutil.rmtree(environment_prefix)
+        return None
+    return clone, runtime
+
+
 def _run_nvidia_smi(command: list[str], *, timeout: int = 10) -> subprocess.CompletedProcess[str]:
     result = _run_process(command, cwd=PROJECT_ROOT, timeout=timeout)
     if result.returncode == 0:
@@ -295,6 +398,25 @@ def _run_nvidia_smi(command: list[str], *, timeout: int = 10) -> subprocess.Comp
     return fallback if fallback.returncode == 0 else result
 
 
+def _parse_cuda_capability(value: str | None) -> tuple[int, int] | None:
+    if not value:
+        return None
+    match = re.search(r"([0-9]+)(?:\.([0-9]+))?", value)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2) or 0)
+
+
+def _select_pytorch_cuda_index_url(reported_cuda_version: str | None) -> str | None:
+    capability = _parse_cuda_capability(reported_cuda_version)
+    if capability is None:
+        return None
+    for minimum, index_url in PYTORCH_CUDA_INDEX_BY_DRIVER_CUDA:
+        if capability >= minimum:
+            return index_url
+    return None
+
+
 def _detect_hardware() -> HardwareProfile:
     try:
         result = _run_nvidia_smi(["nvidia-smi"], timeout=10)
@@ -310,12 +432,21 @@ def _detect_hardware() -> HardwareProfile:
     detail_parts = [part.strip() for part in details.stdout.splitlines()[0].split(",")] if details.stdout.strip() else []
     cuda_match = re.search(r"CUDA Version:\s*([0-9.]+)", result.stdout)
     driver_match = re.search(r"Driver Version:\s*([0-9.]+)", result.stdout)
+    reported_cuda_version = cuda_match.group(1) if cuda_match else None
+    torch_index_url = _select_pytorch_cuda_index_url(reported_cuda_version)
+    if torch_index_url is None:
+        return HardwareProfile(
+            accelerator="cpu",
+            gpu_name=detail_parts[0] if detail_parts else "NVIDIA GPU",
+            driver_version=detail_parts[1] if len(detail_parts) > 1 else (driver_match.group(1) if driver_match else None),
+            reported_cuda_version=reported_cuda_version,
+        )
     return HardwareProfile(
         accelerator="cuda",
         gpu_name=detail_parts[0] if detail_parts else "NVIDIA GPU",
         driver_version=detail_parts[1] if len(detail_parts) > 1 else (driver_match.group(1) if driver_match else None),
-        reported_cuda_version=cuda_match.group(1) if cuda_match else None,
-        torch_index_url=PYTORCH_CUDA_INDEX_URL,
+        reported_cuda_version=reported_cuda_version,
+        torch_index_url=torch_index_url,
     )
 
 
@@ -404,7 +535,10 @@ def _read_hardware_profile(path: str | Path) -> HardwareProfile | None:
     if not isinstance(data, dict) or data.get("accelerator") not in {"cpu", "cuda"}:
         return None
     if data["accelerator"] == "cuda" and not data.get("torch_index_url"):
-        return None
+        selected_index = _select_pytorch_cuda_index_url(data.get("reported_cuda_version"))
+        if selected_index is None:
+            return None
+        data["torch_index_url"] = selected_index
     allowed = set(HardwareProfile.__dataclass_fields__)
     return HardwareProfile(**{key: value for key, value in data.items() if key in allowed})
 
@@ -435,6 +569,10 @@ def _record_verified_runtime(path: str | Path, hardware: HardwareProfile, runtim
     return verified
 
 
+def _torch_index_url_for_hardware(hardware: HardwareProfile) -> str | None:
+    return hardware.torch_index_url or _select_pytorch_cuda_index_url(hardware.reported_cuda_version)
+
+
 def _environment_python(environment_prefix: Path) -> Path:
     executable = "python.exe" if os.name == "nt" else "bin/python"
     return environment_prefix / executable
@@ -463,7 +601,13 @@ def _install_torch_runtime(
     ]
     if hardware.accelerator == "cuda":
         uninstall = _run_process([python, "-m", "pip", "uninstall", "-y", "torch"], cwd=cwd, timeout=timeout)
-        command.extend(["--index-url", hardware.torch_index_url or PYTORCH_CUDA_INDEX_URL])
+        torch_index_url = _torch_index_url_for_hardware(hardware)
+        if torch_index_url is None:
+            raise RuntimeError(
+                "NVIDIA GPU detected, but no compatible PyTorch CUDA wheel index could be selected "
+                f"from reported CUDA version {hardware.reported_cuda_version!r}."
+            )
+        command.extend(["--index-url", torch_index_url])
     attempts: list[subprocess.CompletedProcess[str]] = []
     for attempt in range(1, TORCH_INSTALL_ATTEMPTS + 1):
         install = _run_process(command, cwd=cwd, timeout=timeout)
@@ -603,7 +747,11 @@ def run_experiment_agent(
 ) -> ExperimentRunState:
     if progress_callback is not None:
         progress_callback("initialize")
-    run_id = request.run_name or f"{default_run_id()}-{uuid.uuid4().hex[:8]}"
+    run_id = (
+        unique_run_id(request.run_name)
+        if request.run_name_is_prefix
+        else request.run_name or f"{default_run_id()}-{uuid.uuid4().hex[:8]}"
+    )
     workspace = ensure_dir(request.workspace_root / run_id)
     run_results = ensure_dir(request.results_root / run_id)
     request_file = write_text(

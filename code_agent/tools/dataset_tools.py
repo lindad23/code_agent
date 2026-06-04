@@ -11,6 +11,20 @@ from pathlib import Path
 from code_agent.tools.file_tools import ensure_dir, write_text
 
 
+def _is_missing_huggingface_resource_error(exc: Exception) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(
+        marker in text
+        for marker in (
+            "repository not found",
+            "repo not found",
+            "404",
+            "not found",
+            "does not exist",
+        )
+    )
+
+
 def download_huggingface_dataset(dataset_id: str, subset: str | None, cache_dir: str | Path):
     try:
         from datasets import DownloadConfig, load_dataset
@@ -21,9 +35,14 @@ def download_huggingface_dataset(dataset_id: str, subset: str | None, cache_dir:
 
     cache = ensure_dir(cache_dir)
     download_config = DownloadConfig(max_retries=5, resume_download=True)
-    if subset:
-        return load_dataset(dataset_id, subset, cache_dir=str(cache), download_config=download_config)
-    return load_dataset(dataset_id, cache_dir=str(cache), download_config=download_config)
+    try:
+        if subset:
+            return load_dataset(dataset_id, subset, cache_dir=str(cache), download_config=download_config)
+        return load_dataset(dataset_id, cache_dir=str(cache), download_config=download_config)
+    except Exception as exc:
+        if _is_missing_huggingface_resource_error(exc):
+            raise RuntimeError(f"指定网址不存在: {dataset_id}") from exc
+        raise
 
 
 def download_huggingface_repository(repo_id: str, local_dir: str | Path, *, repo_type: str = "model") -> Path:
@@ -35,7 +54,12 @@ def download_huggingface_repository(repo_id: str, local_dir: str | Path, *, repo
         ) from exc
 
     target = ensure_dir(local_dir)
-    snapshot_download(repo_id=repo_id, repo_type=repo_type, local_dir=str(target))
+    try:
+        snapshot_download(repo_id=repo_id, repo_type=repo_type, local_dir=str(target))
+    except Exception as exc:
+        if _is_missing_huggingface_resource_error(exc):
+            raise RuntimeError(f"指定网址不存在: {repo_id}") from exc
+        raise
     return target
 
 

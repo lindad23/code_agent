@@ -4,6 +4,8 @@ import argparse
 import json
 
 from code_agent.experiments.agent import run_experiment_agent
+from code_agent.experiments.generic_agent import run_generic_experiment_agent
+from code_agent.experiments.input_config import load_input_run_config
 from code_agent.experiments.models import ExperimentRequest
 from code_agent.experiments.study_agent import run_study_experiment_agent, run_study_planning_agent
 from code_agent.utils.progress import CliProgress
@@ -13,6 +15,11 @@ STEP_LABELS = {
     "initialize": "initialize run",
     "request_plan": "request experiment plan",
     "request_study_plan": "request study plan",
+    "request_generic_plan": "request generic experiment plan",
+    "materialize_resources": "materialize resources",
+    "request_generic_execution": "request generic execution spec",
+    "run_generic_commands": "execute generic commands",
+    "debug_generic_execution": "debug generic execution",
     "implement_improvement": "generate improved algorithm code",
     "prepare_environment": "prepare conda environment",
     "run_experiment": "execute experiment",
@@ -22,10 +29,11 @@ STEP_LABELS = {
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="让 AI 实现 task 中指定的代码改动，并与 baseline 运行受控对比实验。")
-    parser.add_argument("--baseline-url", required=True, help="Baseline 的 Hugging Face 模型仓库网址或 repo id。")
-    parser.add_argument("--benchmark-url", required=True, help="Benchmark 的 Hugging Face 数据集网址或 repo id。")
-    parser.add_argument("--task", required=True, help="包含具体改动的任务描述，例如：在 improved 中实现 focal loss 并验证 accuracy。")
-    parser.add_argument("-api", "--api", dest="api_provider", required=True, choices=["deepseek", "openai"], help="规划与实现代码所用 API。")
+    parser.add_argument("--input", default=None, help="从 JSON 输入文件读取实验配置，例如 inputs.json。")
+    parser.add_argument("--baseline-url", default=None, help="Baseline 的 Hugging Face 模型仓库网址或 repo id。")
+    parser.add_argument("--benchmark-url", default=None, help="Benchmark 的 Hugging Face 数据集网址或 repo id。")
+    parser.add_argument("--task", default=None, help="包含具体改动的任务描述，例如：在 improved 中实现 focal loss 并验证 accuracy。")
+    parser.add_argument("-api", "--api", dest="api_provider", default=None, choices=["deepseek", "openai"], help="规划与实现代码所用 API。")
     parser.add_argument("--model", dest="llm_model", default=None, help="覆盖规划和实现 API 的默认模型。")
     parser.add_argument("--workspace-root", default="./workspaces/experiments", help="实验 workspace 根目录。")
     parser.add_argument("--results-root", default="./results/experiments", help="实验结果根目录。")
@@ -56,7 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--study-mode",
-        default="quick",
+        default=None,
         help="配合 --study-execute 使用；通常为 quick 或 full。",
     )
     parser.add_argument("--plan-only", action="store_true", help="仅生成并校验实验计划，不生成实现代码、不创建环境或运行实验。")
@@ -68,33 +76,78 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if sum(bool(flag) for flag in (args.study_plan_only, args.study_execute, args.plan_only)) > 1:
         raise SystemExit("--study-plan-only, --study-execute and --plan-only are mutually exclusive.")
-    request = ExperimentRequest(
-        baseline_url=args.baseline_url,
-        benchmark_url=args.benchmark_url,
-        task=args.task,
-        api_provider=args.api_provider,
-        llm_model=args.llm_model,
-        workspace_root=args.workspace_root,
-        results_root=args.results_root,
-        run_name=args.run_name,
-        environment_python=args.python_version,
-        timeout_seconds=args.timeout_seconds,
-        plan_timeout_seconds=args.plan_timeout_seconds,
-        reuse_environment=args.reuse_environment,
-        hardware_profile_file=args.hardware_profile,
-        refresh_hardware_profile=args.refresh_hardware_profile,
-    )
-    if args.study_plan_only:
+    input_config = load_input_run_config(args.input) if args.input else None
+    if input_config is not None:
+        request = ExperimentRequest.model_validate(
+            {
+                **input_config.request.model_dump(mode="json"),
+                "api_provider": args.api_provider or input_config.request.api_provider,
+                "llm_model": args.llm_model or input_config.request.llm_model,
+                "workspace_root": args.workspace_root,
+                "results_root": args.results_root,
+                "run_name": args.run_name or input_config.request.run_name,
+                "run_name_is_prefix": input_config.request.run_name_is_prefix if not args.run_name else False,
+                "environment_python": args.python_version,
+                "timeout_seconds": args.timeout_seconds,
+                "plan_timeout_seconds": args.plan_timeout_seconds,
+                "reuse_environment": args.reuse_environment,
+                "hardware_profile_file": args.hardware_profile,
+                "refresh_hardware_profile": args.refresh_hardware_profile,
+            }
+        )
+        execute_study = input_config.use_study
+        study_mode = args.study_mode or input_config.study_mode
+        backend = input_config.backend
+    else:
+        missing = [
+            name
+            for name, value in (
+                ("--baseline-url", args.baseline_url),
+                ("--benchmark-url", args.benchmark_url),
+                ("--task", args.task),
+                ("-api/--api", args.api_provider),
+            )
+            if not value
+        ]
+        if missing:
+            raise SystemExit("Missing required arguments without --input: " + ", ".join(missing))
+        request = ExperimentRequest(
+            baseline_url=args.baseline_url,
+            benchmark_url=args.benchmark_url,
+            task=args.task,
+            api_provider=args.api_provider,
+            llm_model=args.llm_model,
+            workspace_root=args.workspace_root,
+            results_root=args.results_root,
+            run_name=args.run_name,
+            environment_python=args.python_version,
+            timeout_seconds=args.timeout_seconds,
+            plan_timeout_seconds=args.plan_timeout_seconds,
+            reuse_environment=args.reuse_environment,
+            hardware_profile_file=args.hardware_profile,
+            refresh_hardware_profile=args.refresh_hardware_profile,
+        )
+        execute_study = args.study_execute
+        study_mode = args.study_mode or "quick"
+        backend = "hf_sequence_classification"
+    if backend == "generic_ai_experiment":
+        progress = CliProgress(2 if args.plan_only else 6, enabled=not args.no_progress)
+        state = run_generic_experiment_agent(
+            request,
+            execute=not args.plan_only,
+            progress_callback=lambda step: progress.update(STEP_LABELS.get(step, step)),
+        )
+    elif args.study_plan_only:
         progress = CliProgress(2, enabled=not args.no_progress)
         state = run_study_planning_agent(
             request,
             progress_callback=lambda step: progress.update(STEP_LABELS.get(step, step)),
         )
-    elif args.study_execute:
+    elif execute_study:
         progress = CliProgress(5, enabled=not args.no_progress)
         state = run_study_experiment_agent(
             request,
-            mode_name=args.study_mode,
+            mode_name=study_mode,
             progress_callback=lambda step: progress.update(STEP_LABELS.get(step, step)),
         )
     else:
@@ -109,7 +162,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         progress.finish()
     print(json.dumps(state.model_dump(mode="json"), ensure_ascii=False, indent=2))
-    return 0 if state.status in {"planned", "study_planned", "completed"} else 1
+    return 0 if state.status in {"planned", "study_planned", "generic_planned", "generic_completed", "completed"} else 1
 
 
 if __name__ == "__main__":

@@ -3,5 +3,6 @@
 -e .[dev,experiment]
 
 # The main development environment may use CPU PyTorch. Experiment runs select
-# and verify the CUDA-enabled PyTorch runtime in their isolated environment.
-torch>=2.4
+# and verify a host-compatible PyTorch runtime from nvidia-smi/driver detection.
+# Do not install plain `torch` here: default PyPI wheels may target a newer CUDA
+# runtime than the host NVIDIA driver supports.

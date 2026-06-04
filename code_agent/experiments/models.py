@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 from typing import Literal
+import uuid
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -13,9 +15,15 @@ class ExperimentRequest(BaseModel):
     task: str = Field(min_length=3)
     api_provider: Literal["deepseek", "openai"]
     llm_model: str | None = None
+    baseline_url_explicit: bool = True
+    benchmark_url_explicit: bool = True
+    baseline_resources: dict[str, str] = Field(default_factory=dict)
+    benchmark_resources: dict[str, str] = Field(default_factory=dict)
+    resource_context: str | None = None
     workspace_root: Path = Path("./workspaces/experiments")
     results_root: Path = Path("./results/experiments")
     run_name: str | None = None
+    run_name_is_prefix: bool = False
     environment_python: str = "3.11"
     timeout_seconds: int = Field(default=86400, gt=0)
     plan_timeout_seconds: int = Field(default=60, gt=0, le=600)
@@ -137,6 +145,14 @@ class ExperimentRunState(BaseModel):
 
 def default_run_id() -> str:
     return "experiment-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def unique_run_id(prefix: str | None = None) -> str:
+    generated = f"{default_run_id()}-{uuid.uuid4().hex[:8]}"
+    if prefix is None or not prefix.strip():
+        return generated
+    cleaned = re.sub(r"[\s/\\:]+", "_", prefix.strip()).strip("._-")
+    return f"{cleaned}-{generated}" if cleaned else generated
 
 
 class StudyMode(BaseModel):

@@ -14,6 +14,7 @@ from code_agent.experiments.agent import (
     _select_cached_environment,
     _select_execution_gpu,
     _select_previous_completed_environment,
+    _try_clone_current_environment,
     _configured_conda_url_channels,
     _detect_hardware,
     _install_experiment_dependencies,
@@ -22,6 +23,7 @@ from code_agent.experiments.agent import (
     _record_verified_runtime,
     _resolve_hardware_profile,
     _run_process_streaming,
+    _select_pytorch_cuda_index_url,
     _write_environment_file,
 )
 from code_agent.experiments.models import ExperimentRequest
@@ -134,6 +136,101 @@ def test_environment_cache_ignores_missing_interpreter(tmp_path):
     cache_root.joinpath("registry.json").write_text(json.dumps(registry), encoding="utf-8")
 
     assert _select_cached_environment(cache_root, "abc") is None
+
+
+def test_try_clone_current_environment_reuses_verified_torch(monkeypatch, tmp_path):
+    request = ExperimentRequest(
+        baseline_url="model/id",
+        benchmark_url="dataset/id",
+        task="train",
+        api_provider="deepseek",
+        environment_python=f"{sys.version_info.major}.{sys.version_info.minor}",
+    )
+    hardware = HardwareProfile(
+        accelerator="cuda",
+        torch_version="2.11.0+cu128",
+        torch_cuda_version="12.8",
+    )
+    cache_root = tmp_path / "asset_cache" / "environments"
+    environment_prefix = cache_root / "env-abc123"
+    environment_prefix.mkdir(parents=True)
+    environment_prefix.joinpath("stale.txt").write_text("partial", encoding="utf-8")
+    seed_prefix = tmp_path / "code-agent-env"
+    seed_prefix.mkdir()
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr("code_agent.experiments.agent.sys.prefix", str(seed_prefix))
+
+    def fake_run_process(command, *, cwd, timeout):
+        commands.append(command)
+        if command[0] == sys.executable:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                json.dumps(
+                    {
+                        "torch_version": "2.11.0+cu128",
+                        "cuda_available": True,
+                        "torch_cuda_version": "12.8",
+                        "device_name": "GPU",
+                    }
+                ),
+                "",
+            )
+        if command[:3] == ["conda", "create", "--yes"]:
+            environment_prefix.mkdir(parents=True, exist_ok=True)
+            return subprocess.CompletedProcess(command, 0, "cloned", "")
+        raise AssertionError(command)
+
+    monkeypatch.setattr("code_agent.experiments.agent._run_process", fake_run_process)
+
+    cloned = _try_clone_current_environment(
+        request,
+        hardware,
+        environment_prefix=environment_prefix,
+        cache_root=cache_root,
+        cwd=tmp_path,
+        timeout=60,
+    )
+
+    assert cloned is not None
+    setup, runtime = cloned
+    assert setup.stdout == "cloned"
+    assert runtime["torch_version"] == "2.11.0+cu128"
+    assert not environment_prefix.joinpath("stale.txt").exists()
+    assert any(command[:3] == ["conda", "create", "--yes"] and "--clone" in command for command in commands)
+
+
+def test_try_clone_current_environment_skips_mismatched_python(monkeypatch, tmp_path):
+    request = ExperimentRequest(
+        baseline_url="model/id",
+        benchmark_url="dataset/id",
+        task="train",
+        api_provider="deepseek",
+        environment_python="9.99",
+    )
+    cache_root = tmp_path / "asset_cache" / "environments"
+    environment_prefix = cache_root / "env-abc123"
+    calls: list[list[str]] = []
+
+    def fake_run_process(command, *, cwd, timeout):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, "{}", "")
+
+    monkeypatch.setattr("code_agent.experiments.agent._run_process", fake_run_process)
+
+    assert (
+        _try_clone_current_environment(
+            request,
+            HardwareProfile(accelerator="cuda"),
+            environment_prefix=environment_prefix,
+            cache_root=cache_root,
+            cwd=tmp_path,
+            timeout=60,
+        )
+        is None
+    )
+    assert calls == []
 
 
 def test_environment_cache_can_reuse_previous_completed_run(tmp_path):
@@ -265,7 +362,17 @@ def test_detect_hardware_uses_cuda_wheel_index_when_nvidia_smi_is_available(monk
     assert hardware.accelerator == "cuda"
     assert hardware.gpu_name == "NVIDIA GeForce RTX 5060 Laptop GPU"
     assert hardware.reported_cuda_version == "13.1"
-    assert hardware.torch_index_url == PYTORCH_CUDA_INDEX_URL
+    assert hardware.torch_index_url == "https://download.pytorch.org/whl/cu130"
+
+
+def test_select_pytorch_cuda_index_url_matches_driver_capability():
+    assert _select_pytorch_cuda_index_url("13.1") == "https://download.pytorch.org/whl/cu130"
+    assert _select_pytorch_cuda_index_url("12.8") == "https://download.pytorch.org/whl/cu128"
+    assert _select_pytorch_cuda_index_url("12.6") == "https://download.pytorch.org/whl/cu126"
+    assert _select_pytorch_cuda_index_url("12.4") == "https://download.pytorch.org/whl/cu124"
+    assert _select_pytorch_cuda_index_url("12.1") == "https://download.pytorch.org/whl/cu121"
+    assert _select_pytorch_cuda_index_url("11.8") == "https://download.pytorch.org/whl/cu118"
+    assert _select_pytorch_cuda_index_url("11.7") is None
 
 
 def test_select_execution_gpu_prefers_most_free_memory(monkeypatch):

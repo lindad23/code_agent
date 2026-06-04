@@ -42,21 +42,43 @@ def parse_huggingface_id(value: str, *, repo_type: str) -> str:
     return "/".join(parts[:2])
 
 
-def build_experiment_plan_prompt(request: ExperimentRequest, model_id: str, dataset_id: str) -> str:
+def _resource_context_block(request: ExperimentRequest) -> str:
+    if not request.resource_context:
+        return ""
+    return f"""
+Additional structured input context:
+{request.resource_context}
+"""
+
+
+def _model_requirement(model_id: str | None) -> str:
+    if model_id is not None:
+        return f'- model_id must be "{model_id}".'
+    return "- Resolve model_id to a concrete Hugging Face model repository from the baseline resource name/context."
+
+
+def _dataset_requirement(dataset_id: str | None) -> str:
+    if dataset_id is not None:
+        return f'- dataset_id must be "{dataset_id}".'
+    return "- Resolve dataset_id to a concrete Hugging Face dataset repository from the benchmark resource name/context."
+
+
+def build_experiment_plan_prompt(request: ExperimentRequest, model_id: str | None, dataset_id: str | None) -> str:
     return f"""Prepare a controlled baseline-versus-user-requested-code-change Hugging Face text-classification experiment plan.
 
-Baseline model URL:
+Baseline model URL or resource name:
 {request.baseline_url}
 Resolved model id:
-{model_id}
+{model_id or "AI must resolve from the resource name/context"}
 
-Benchmark dataset URL:
+Benchmark dataset URL or resource name:
 {request.benchmark_url}
 Resolved dataset id:
-{dataset_id}
+{dataset_id or "AI must resolve from the resource name/context"}
 
 User task:
 {request.task}
+{_resource_context_block(request)}
 
 The executor supports only Hugging Face sequence classification fine-tuning. Infer the dataset configuration/subtask,
 input text column names, label column, train/evaluation split names, and reasonable training hyperparameters.
@@ -85,8 +107,8 @@ implementation must contain exactly:
 name, implementation_instructions.
 
 Requirements:
-- model_id must be "{model_id}".
-- dataset_id must be "{dataset_id}".
+{_model_requirement(model_id)}
+{_dataset_requirement(dataset_id)}
 - task_type must be "sequence_classification".
 - metric_name must be "accuracy".
 - baseline.method must be "baseline"; improved.method must be "improved".
@@ -103,21 +125,22 @@ Requirements:
 """
 
 
-def build_experiment_study_prompt(request: ExperimentRequest, model_id: str, dataset_id: str) -> str:
+def build_experiment_study_prompt(request: ExperimentRequest, model_id: str | None, dataset_id: str | None) -> str:
     return f"""Prepare a study-level Hugging Face text-classification experiment matrix.
 
-Baseline model URL:
+Baseline model URL or resource name:
 {request.baseline_url}
 Resolved model id:
-{model_id}
+{model_id or "AI must resolve from the resource name/context"}
 
-Benchmark dataset URL:
+Benchmark dataset URL or resource name:
 {request.benchmark_url}
 Resolved dataset id:
-{dataset_id}
+{dataset_id or "AI must resolve from the resource name/context"}
 
 User task:
 {request.task}
+{_resource_context_block(request)}
 
 The study planner describes an experiment matrix. Do not collapse multiple benchmarks, seeds,
 variants, modes, or resource/debug requirements into a single representative run.
@@ -138,8 +161,8 @@ model_id, dataset_id, task_type, modes, benchmarks, variants, implementation,
 resource_logging, launch, failure_policy, result_table_columns, rationale.
 
 Requirements:
-- model_id must be "{model_id}".
-- dataset_id must be "{dataset_id}".
+{_model_requirement(model_id)}
+{_dataset_requirement(dataset_id)}
 - task_type must be "sequence_classification".
 - modes must include quick and full when the user asks for quick mode and full mode.
 - modes.quick must be a cheap smoke-test mode with non-null max_train_samples and max_eval_samples.
@@ -180,23 +203,23 @@ def extract_json_object(text: str) -> dict:
     return result
 
 
-def prepare_plan_request(request: ExperimentRequest) -> tuple[str, str, str]:
-    model_id = parse_huggingface_id(request.baseline_url, repo_type="model")
-    dataset_id = parse_huggingface_id(request.benchmark_url, repo_type="dataset")
+def prepare_plan_request(request: ExperimentRequest) -> tuple[str | None, str | None, str]:
+    model_id = parse_huggingface_id(request.baseline_url, repo_type="model") if request.baseline_url_explicit else None
+    dataset_id = parse_huggingface_id(request.benchmark_url, repo_type="dataset") if request.benchmark_url_explicit else None
     return model_id, dataset_id, build_experiment_plan_prompt(request, model_id, dataset_id)
 
 
-def prepare_study_plan_request(request: ExperimentRequest) -> tuple[str, str, str]:
-    model_id = parse_huggingface_id(request.baseline_url, repo_type="model")
-    dataset_id = parse_huggingface_id(request.benchmark_url, repo_type="dataset")
+def prepare_study_plan_request(request: ExperimentRequest) -> tuple[str | None, str | None, str]:
+    model_id = parse_huggingface_id(request.baseline_url, repo_type="model") if request.baseline_url_explicit else None
+    dataset_id = parse_huggingface_id(request.benchmark_url, repo_type="dataset") if request.benchmark_url_explicit else None
     return model_id, dataset_id, build_experiment_study_prompt(request, model_id, dataset_id)
 
 
 def request_experiment_plan(
     request: ExperimentRequest,
     *,
-    model_id: str,
-    dataset_id: str,
+    model_id: str | None,
+    dataset_id: str | None,
     prompt: str,
     temperature: float = 0.1,
     max_tokens: int = 2048,
@@ -214,16 +237,18 @@ def request_experiment_plan(
         timeout=request.plan_timeout_seconds,
     )
     plan = ComparisonPlan.model_validate(extract_json_object(response))
-    if plan.model_id != model_id or plan.dataset_id != dataset_id:
-        raise ValueError("The planned repositories do not match the user-provided URLs.")
+    if model_id is not None and plan.model_id != model_id:
+        raise ValueError("The planned model repository does not match the user-provided URL.")
+    if dataset_id is not None and plan.dataset_id != dataset_id:
+        raise ValueError("The planned dataset repository does not match the user-provided URL.")
     return plan, response
 
 
 def request_experiment_study_plan(
     request: ExperimentRequest,
     *,
-    model_id: str,
-    dataset_id: str,
+    model_id: str | None,
+    dataset_id: str | None,
     prompt: str,
     temperature: float = 0.1,
     max_tokens: int = 4096,
@@ -247,8 +272,10 @@ def request_experiment_study_plan(
         )
     except Exception as exc:
         raise PlanValidationError(str(exc), response=response) from exc
-    if plan.model_id != model_id or plan.dataset_id != dataset_id:
-        raise ValueError("The planned repositories do not match the user-provided URLs.")
+    if model_id is not None and plan.model_id != model_id:
+        raise ValueError("The planned model repository does not match the user-provided URL.")
+    if dataset_id is not None and plan.dataset_id != dataset_id:
+        raise ValueError("The planned dataset repository does not match the user-provided URL.")
     return plan, response
 
 

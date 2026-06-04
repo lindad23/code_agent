@@ -1,6 +1,8 @@
 import sys
 from types import ModuleType
 
+import pytest
+
 from code_agent.tools import dataset_tools
 
 
@@ -81,3 +83,16 @@ def test_repository_copy_can_select_allowed_patterns(monkeypatch, tmp_path):
     assert target.joinpath("README.md").exists()
     assert target.joinpath("sst2", "train.parquet").read_text(encoding="utf-8") == "sst2"
     assert not target.joinpath("mnli_matched").exists()
+
+
+def test_missing_repository_reports_user_facing_url_error(monkeypatch, tmp_path):
+    fake_hub = ModuleType("huggingface_hub")
+
+    def fake_snapshot_download(**kwargs):
+        raise RuntimeError("Repository Not Found for url: https://huggingface.co/missing/model")
+
+    fake_hub.snapshot_download = fake_snapshot_download
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+
+    with pytest.raises(RuntimeError, match="指定网址不存在: missing/model"):
+        dataset_tools.download_huggingface_repository("missing/model", tmp_path)
